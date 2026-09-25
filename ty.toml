@@ -1,0 +1,9 @@
+[environment]
+python-version = "3.12"
+root = ["."]
+
+[analysis]
+replace-imports-with-any = ["binaryninja.**", "binaryninjaui.**", "PySide6.**"]
+
+[src]
+include = ["plugin", "tests"]
