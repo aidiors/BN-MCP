@@ -12,6 +12,7 @@ const limit = z.number().int().min(1).max(200).default(100);
 const page = { offset: z.number().int(), limit: z.number().int(),
   next_offset: z.number().int().nullable(), truncated: z.boolean() };
 const namedAddress = z.object({ name: z.string(), address: z.string() }).passthrough();
+const functionSummary = z.object({ name: z.string(), address: z.string() });
 
 async function result(request: Promise<Record<string, unknown>>) {
   try {
@@ -106,6 +107,53 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
     annotations: { readOnlyHint: true },
   }, async ({ binary_id, identifier, view, ssa, offset, limit }) =>
     result(client.requestJson("/agent/il", { binaryId: binary_id, identifier, view, ssa, offset, limit })));
+
+  server.registerTool("decompile_function", {
+    description: "Page rendered Pseudo C for a function, falling back to address-prefixed HLIL if Pseudo C rendering is unavailable.",
+    inputSchema: { binary_id: binaryId, identifier, offset,
+      limit: z.number().int().min(1).max(200).default(80) },
+    outputSchema: z.object({ binary_id: z.string(), function: functionSummary,
+      representation: z.enum(["pseudo_c", "hlil"]), lines: z.array(z.string()), ...page }),
+    annotations: { readOnlyHint: true },
+  }, async ({ binary_id, identifier, offset, limit }) =>
+    result(client.requestJson("/agent/decompile",
+      { binaryId: binary_id, identifier, offset, limit })));
+
+  server.registerTool("disassemble_function", {
+    description: "Page native disassembly lines with virtual addresses for a function.",
+    inputSchema: { binary_id: binaryId, identifier, offset,
+      limit: z.number().int().min(1).max(200).default(80) },
+    outputSchema: z.object({ binary_id: z.string(), function: functionSummary,
+      lines: z.array(z.string()), ...page }),
+    annotations: { readOnlyHint: true },
+  }, async ({ binary_id, identifier, offset, limit }) =>
+    result(client.requestJson("/agent/disassembly",
+      { binaryId: binary_id, identifier, offset, limit })));
+
+  server.registerTool("basic_blocks", {
+    description: "Page a function's CFG blocks with address ranges, exit state, and outgoing branch edges.",
+    inputSchema: { binary_id: binaryId, identifier, offset, limit },
+    outputSchema: z.object({ binary_id: z.string(), function: functionSummary,
+      blocks: z.array(z.object({ index: z.number().int(), start: z.string(), end: z.string(),
+        length: z.number().int(), instruction_count: z.number().int(), can_exit: z.boolean(),
+        has_undetermined_outgoing_edges: z.boolean(),
+        outgoing_edges: z.array(z.object({ type: z.string(), target: z.string().nullable(),
+          fall_through: z.boolean(), back_edge: z.boolean() })) })), ...page }),
+    annotations: { readOnlyHint: true },
+  }, async ({ binary_id, identifier, offset, limit }) =>
+    result(client.requestJson("/agent/basicBlocks",
+      { binaryId: binary_id, identifier, offset, limit })));
+
+  server.registerTool("stack_frame", {
+    description: "Page a function's stack variables with names, storage offsets, sizes, and types.",
+    inputSchema: { binary_id: binaryId, identifier, offset, limit },
+    outputSchema: z.object({ binary_id: z.string(), function: functionSummary,
+      variables: z.array(z.object({ name: z.string(), offset: z.string(),
+        size: z.string(), type: z.string() })), ...page }),
+    annotations: { readOnlyHint: true },
+  }, async ({ binary_id, identifier, offset, limit }) =>
+    result(client.requestJson("/agent/stackFrame",
+      { binaryId: binary_id, identifier, offset, limit })));
 
   server.registerTool("xrefs_to", {
     description: "Page inbound code and/or data references to an address. Each code reference includes its containing function when known.",

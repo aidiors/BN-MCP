@@ -4,6 +4,7 @@ from typing import Any
 import binaryninja as bn
 
 from ..core.binary_operations import BinaryOperations
+from ..core.read_only_queries import page_items
 
 
 class BinaryNinjaEndpoints:
@@ -882,6 +883,20 @@ class BinaryNinjaEndpoints:
         result.append({"addr": hex(func.start), "vars": vars_list})
 
         return result
+
+    def get_stack_frame_page(
+        self, function_identifier: str | int, offset: int = 0, limit: int = 100
+    ) -> dict[str, Any]:
+        if offset < 0 or not 1 <= limit <= 200:
+            raise ValueError("offset must be >= 0 and limit must be 1..200")
+        frame = self.get_stack_frame_vars(function_identifier)[0]
+        info = self.binary_ops.get_function_info(function_identifier)
+        if info is None:
+            raise ValueError(f"Function '{function_identifier}' not found")
+        return {
+            "function": {"name": info["name"], "address": info["address"]},
+            **page_items(frame["vars"], offset, limit, lambda variable: variable, "variables"),
+        }
 
     def patch_bytes(
         self, address: str | int, data: str | bytes | list[int], save_to_file: bool = True

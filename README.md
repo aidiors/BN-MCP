@@ -4,16 +4,16 @@ Licensed under Apache-2.0. See [LICENSE](LICENSE) for the full license text.
 
 ## What is available
 
-The Node bridge exposes 17 tools with input and output schemas. A local HTTP server inside Binary Ninja executes them. Every binary query requires `binary_id` from `list_binaries`, and every result identifies the binary. Requests are serialized inside Binary Ninja. Read responses have bounded pages; errors set MCP `isError`.
+The Node bridge exposes 21 tools with input and output schemas. A local HTTP server inside Binary Ninja executes them. Every binary query requires `binary_id` from `list_binaries`, and every result identifies the binary. Requests are serialized inside Binary Ninja. Read responses have bounded pages; errors set MCP `isError`.
 
 | Task | Tools |
 | --- | --- |
 | Choose and identify a view | `list_binaries`, `binary_info` |
 | Locate evidence | `find_functions`, `find_strings`, `function_at`, `entry_points`, `list_imports`, `list_exports` |
-| Inspect code and data | `inspect_function`, `related_functions`, `function_il`, `xrefs_to`, `read_bytes`, `read_comment`, `memory_map` |
+| Inspect code and data | `inspect_function`, `related_functions`, `function_il`, `decompile_function`, `disassemble_function`, `basic_blocks`, `stack_frame`, `xrefs_to`, `read_bytes`, `read_comment`, `memory_map` |
 | Add checked annotations | `rename_function`, `set_comment` |
 
-For a paged response, use `next_offset` until `truncated` is false. `function_il` returns at most 200 instructions, `xrefs_to` at most 200 references, `find_functions` and `find_strings` at most 200 records, and `read_bytes` at most 4096 bytes. String values are capped at 4096 characters. The two annotation tools require the previous name or comment and fail if it changed after the agent read it. They modify Binary Ninja analysis state; save the database in Binary Ninja when the changes are ready to keep.
+For a paged response, use `next_offset` until `truncated` is false. `function_il`, `decompile_function`, `disassemble_function`, `basic_blocks`, and `stack_frame` return at most 200 records per page; `xrefs_to`, `find_functions`, and `find_strings` also return at most 200 records. `read_bytes` is capped at 4096 bytes and string values at 4096 characters. The two annotation tools require the previous name or comment and fail if it changed after the agent read it. They modify Binary Ninja analysis state; save the database in Binary Ninja when the changes are ready to keep.
 
 `binary_info(include_sha256=true)` hashes the **current original file on disk**. A saved BNDB may describe different bytes; check that separately when exact provenance matters.
 

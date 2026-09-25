@@ -135,6 +135,22 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 offset,
                 limit,
             )
+        if path == "/agent/decompile":
+            return ops.get_function_decompiled_page(
+                self._required(params, "identifier"), offset, limit
+            )
+        if path == "/agent/disassembly":
+            return ops.get_function_disassembly_page(
+                self._required(params, "identifier"), offset, limit
+            )
+        if path == "/agent/basicBlocks":
+            return ops.get_function_basic_blocks_page(
+                self._required(params, "identifier"), offset, limit
+            )
+        if path == "/agent/stackFrame":
+            return endpoints.get_stack_frame_page(
+                self._required(params, "identifier"), offset, limit
+            )
         if path == "/agent/xrefs":
             return ops.get_xrefs_to_page(
                 self._required(params, "address"),

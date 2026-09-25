@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable
-from itertools import chain
+from itertools import chain, islice
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +100,22 @@ def page_instructions(
         "offset": offset,
         "limit": limit,
         "next_offset": offset + len(lines) if more else None,
+        "truncated": more,
+    }
+
+
+def page_items(
+    items: Iterable[Any], offset: int, limit: int, convert: Any, key: str
+) -> dict[str, Any]:
+    if offset < 0 or not 1 <= limit <= 200:
+        raise ValueError("offset must be >= 0 and limit must be 1..200")
+    window = list(islice(items, offset, offset + limit + 1))
+    more = len(window) > limit
+    return {
+        key: [convert(item) for item in window[:limit]],
+        "offset": offset,
+        "limit": limit,
+        "next_offset": offset + limit if more else None,
         "truncated": more,
     }
 

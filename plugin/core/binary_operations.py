@@ -16,6 +16,7 @@ from .read_only_queries import (
     functions_containing,
     page_functions,
     page_instructions,
+    page_items,
     page_related_functions,
     page_strings,
     page_symbols,
@@ -127,6 +128,137 @@ class BinaryOperations:
             "view": view,
             "ssa": ssa,
             **page_instructions(il.instructions, function.start, offset, limit),
+        }
+
+    def get_function_decompiled_page(
+        self, identifier: str, offset: int = 0, limit: int = 80
+    ) -> dict[str, Any]:
+        current_view = self._current_view
+        if current_view is None:
+            raise RuntimeError("No binary loaded")
+        function = self.get_function_by_name_or_address(identifier)
+        if function is None:
+            raise ValueError(f"Function not found: {identifier}")
+        if offset < 0 or not 1 <= limit <= 200:
+            raise ValueError("offset must be >= 0 and limit must be 1..200")
+        if getattr(function, "analysis_skipped", False):
+            function.analysis_skipped = False
+            current_view.update_analysis_and_wait()
+        hlil = getattr(function, "hlil", None)
+        if hlil is None:
+            raise RuntimeError(f"HLIL is unavailable for {identifier}")
+
+        representation = None
+        rendered_lines = None
+        language_representation = getattr(function, "language_representation", None)
+        if callable(language_representation):
+            try:
+                representation = language_representation("Pseudo C")
+                if representation is not None:
+                    rendered_lines = representation.get_linear_lines(hlil.root)
+            except Exception:
+                rendered_lines = None
+
+        if rendered_lines is not None:
+            page = page_items(
+                (str(line) for line in rendered_lines),
+                offset,
+                limit,
+                lambda line: line,
+                "lines",
+            )
+            result_language = "pseudo_c"
+        else:
+            page = page_instructions(hlil.instructions, function.start, offset, limit)
+            result_language = "hlil"
+
+        return {
+            "function": {"name": function.name, "address": hex(function.start)},
+            "representation": result_language,
+            **page,
+        }
+
+    def get_function_disassembly_page(
+        self, identifier: str, offset: int = 0, limit: int = 80
+    ) -> dict[str, Any]:
+        if offset < 0 or not 1 <= limit <= 200:
+            raise ValueError("offset must be >= 0 and limit must be 1..200")
+        current_view = self._current_view
+        if current_view is None:
+            raise RuntimeError("No binary loaded")
+        function = self.get_function_by_name_or_address(identifier)
+        if function is None:
+            raise ValueError(f"Function not found: {identifier}")
+        if getattr(function, "analysis_skipped", False):
+            function.analysis_skipped = False
+            current_view.update_analysis_and_wait()
+
+        def disassembly_lines():
+            for block in function.basic_blocks:
+                get_lines = getattr(block, "get_disassembly_text", None)
+                block_lines = get_lines() if callable(get_lines) else block.disassembly_text
+                for line in block_lines:
+                    text = str(line)
+                    address = getattr(line, "address", None)
+                    if address is not None:
+                        text = f"{int(address):08x}        {text}"
+                    yield text
+
+        return {
+            "function": {"name": function.name, "address": hex(function.start)},
+            **page_items(disassembly_lines(), offset, limit, lambda line: line, "lines"),
+        }
+
+    def get_function_basic_blocks_page(
+        self, identifier: str, offset: int = 0, limit: int = 100
+    ) -> dict[str, Any]:
+        if offset < 0 or not 1 <= limit <= 200:
+            raise ValueError("offset must be >= 0 and limit must be 1..200")
+        current_view = self._current_view
+        if current_view is None:
+            raise RuntimeError("No binary loaded")
+        function = self.get_function_by_name_or_address(identifier)
+        if function is None:
+            raise ValueError(f"Function not found: {identifier}")
+        if getattr(function, "analysis_skipped", False):
+            function.analysis_skipped = False
+            current_view.update_analysis_and_wait()
+
+        def convert_block(block: Any) -> dict[str, Any]:
+            edges = []
+            for edge in getattr(block, "outgoing_edges", ()):
+                target = getattr(edge, "target", None)
+                target_start = getattr(target, "start", None)
+                edges.append(
+                    {
+                        "type": str(getattr(edge, "type", "unknown")),
+                        "target": hex(int(target_start)) if target_start is not None else None,
+                        "fall_through": bool(
+                            getattr(edge, "fall_through", getattr(edge, "fallthrough", False))
+                        ),
+                        "back_edge": bool(
+                            getattr(edge, "back_edge", getattr(edge, "backedge", False))
+                        ),
+                    }
+                )
+            start = int(block.start)
+            end = int(block.end)
+            return {
+                "index": int(getattr(block, "index", 0)),
+                "start": hex(start),
+                "end": hex(end),
+                "length": int(getattr(block, "length", end - start)),
+                "instruction_count": int(getattr(block, "instruction_count", 0)),
+                "can_exit": bool(getattr(block, "can_exit", False)),
+                "has_undetermined_outgoing_edges": bool(
+                    getattr(block, "has_undetermined_outgoing_edges", False)
+                ),
+                "outgoing_edges": edges,
+            }
+
+        return {
+            "function": {"name": function.name, "address": hex(function.start)},
+            **page_items(function.basic_blocks, offset, limit, convert_block, "blocks"),
         }
 
     def get_xrefs_to_page(

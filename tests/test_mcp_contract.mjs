@@ -63,7 +63,7 @@ test("agent tools expose schemas, structured results, and MCP errors", async () 
   try {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     const listed = await client.listTools();
-    assert.equal(listed.tools.length, 17);
+    assert.equal(listed.tools.length, 21);
     const functions = listed.tools.find(tool => tool.name === "find_functions");
     assert.ok(functions.inputSchema.properties.binary_id);
     assert.ok(functions.outputSchema.properties.functions);
