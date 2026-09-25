@@ -1,4 +1,4 @@
-name: Python quality
+name: Quality and tests
 
 on:
   push:
@@ -7,25 +7,31 @@ on:
     branches: [main]
 
 jobs:
-  python-quality:
+  quality-and-tests:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      
-      - name: Install Python quality tools
-        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
-      
-      - name: Run Ruff linter
-        run: ruff check .
-        continue-on-error: false
-      
-      - name: Run Ruff formatter check
-        run: ruff format --check .
 
-      - name: Run ty type check
-        run: ty check
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+
+      - name: Install Python development dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Install bridge dependencies
+        run: npm ci
+        working-directory: bridge
+
+      - name: Run pre-commit checks and tests
+        run: pre-commit run --all-files

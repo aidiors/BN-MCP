@@ -1,0 +1,44 @@
+minimum_pre_commit_version: 4.0.0
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: ruff check
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff format --check
+        entry: ruff format --check
+        language: system
+        types: [python]
+      - id: ty-check
+        name: ty check
+        entry: ty check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: python-tests
+        name: Python unit tests
+        entry: python -m unittest discover -s tests -p 'test_agent_*.py' -v
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: python-compile
+        name: Compile Python plugin
+        entry: python -m compileall -q plugin
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: bridge-build
+        name: Build TypeScript bridge
+        entry: npm --prefix bridge run build
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: mcp-contract-tests
+        name: MCP contract tests
+        entry: node tests/test_mcp_contract.mjs
+        language: system
+        pass_filenames: false
+        always_run: true

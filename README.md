@@ -33,16 +33,12 @@ From the repository root:
 
 ```text
 python -m pip install -r requirements-dev.txt
-ruff check .
-ruff format --check .
-ty check
-python -m unittest discover -s tests -p 'test_agent_*.py' -v
-python -m compileall -q plugin
-node bridge/node_modules/typescript/bin/tsc -p bridge/tsconfig.json
-node tests/test_mcp_contract.mjs
+npm --prefix bridge ci
+pre-commit install
+pre-commit run --all-files
 ```
 
-The Python type check treats Binary Ninja and PySide6 imports as `Any` because their SDKs ship with the application and are not available in CI. The tests cover pagination, binary binding, annotation conflicts, schema exposure, structured MCP results, and error signaling without needing a Binary Ninja process. A live Binary Ninja test is still required after installing this fork.
+The pre-commit hook runs Ruff, ty, Python unit tests, Python compilation, the TypeScript build, and the MCP contract test before each commit. Node.js 18 or newer and installed bridge dependencies are required. The Python type check treats Binary Ninja and PySide6 imports as `Any` because their SDKs ship with the application and are not available in CI. The tests cover pagination, binary binding, annotation conflicts, schema exposure, structured MCP results, and error signaling without needing a Binary Ninja process. A live Binary Ninja test is still required after installing this fork.
 
 ## Scope
 
