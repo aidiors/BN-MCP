@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -19,6 +20,42 @@ class ConflictError(Exception):
     def __init__(self, message: str, current: Any):
         super().__init__(message)
         self.current = current
+
+
+class BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = False
+    block_on_close = True
+    request_queue_size = 64
+
+    def __init__(self, server_address, request_handler_class, max_workers: int = 16):
+        self._request_slots = threading.BoundedSemaphore(max_workers)
+        super().__init__(server_address, request_handler_class)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Retry-After: 1\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
 
 class AgentRequestHandler(BaseHTTPRequestHandler):
@@ -282,7 +319,9 @@ class MCPServer:
         handler = type(
             "AgentRequestHandlerWithOps", (AgentRequestHandler,), {"binary_ops": self.binary_ops}
         )
-        self.server = HTTPServer((self.config.server.host, self.config.server.port), handler)
+        self.server = BoundedThreadingHTTPServer(
+            (self.config.server.host, self.config.server.port), handler
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         bn.log_info(
