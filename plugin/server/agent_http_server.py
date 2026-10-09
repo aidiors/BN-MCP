@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hmac
 import json
+import socket
 import threading
+import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Any
@@ -22,22 +26,48 @@ class ConflictError(Exception):
         self.current = current
 
 
+class ServerStoppingError(Exception):
+    pass
+
+
+class RequestRejected(Exception):
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
 class BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = False
-    block_on_close = True
+    daemon_threads = True
+    block_on_close = False
     request_queue_size = 64
 
-    def __init__(self, server_address, request_handler_class, max_workers: int = 16):
+    def __init__(
+        self,
+        server_address,
+        request_handler_class,
+        max_workers: int = 16,
+        read_timeout: float = 5.0,
+        shutdown_timeout: float = 1.0,
+        auth_token: str = "",
+    ):
         self._request_slots = threading.BoundedSemaphore(max_workers)
+        self._connections_lock = threading.Lock()
+        self._connections: set[socket.socket] = set()
+        self._workers: set[threading.Thread] = set()
+        self._operations_lock = threading.Lock()
+        self.stopping = threading.Event()
+        self.read_timeout = read_timeout
+        self.shutdown_timeout = shutdown_timeout
+        self.auth_token = auth_token
         super().__init__(server_address, request_handler_class)
 
     def process_request(self, request, client_address) -> None:
-        if not self._request_slots.acquire(blocking=False):
+        if self.stopping.is_set() or not self._request_slots.acquire(blocking=False):
             try:
+                request.settimeout(self.read_timeout)
                 request.sendall(
                     b"HTTP/1.1 503 Service Unavailable\r\n"
-                    b"Content-Length: 0\r\n"
-                    b"Retry-After: 1\r\n"
+                    b"Content-Length: 0\r\nRetry-After: 1\r\n"
                     b"Connection: close\r\n\r\n"
                 )
             except OSError:
@@ -45,39 +75,180 @@ class BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
             finally:
                 self.shutdown_request(request)
             return
+        with self._connections_lock:
+            if self.stopping.is_set():
+                self._request_slots.release()
+                self.shutdown_request(request)
+                return
+            self._connections.add(request)
         try:
+            request.settimeout(self.read_timeout)
             super().process_request(request, client_address)
         except Exception:
+            with self._connections_lock:
+                self._connections.discard(request)
             self._request_slots.release()
             raise
 
     def process_request_thread(self, request, client_address) -> None:
+        worker = threading.current_thread()
+        with self._connections_lock:
+            self._workers.add(worker)
         try:
             super().process_request_thread(request, client_address)
         finally:
+            with self._connections_lock:
+                self._connections.discard(request)
+                self._workers.discard(worker)
             self._request_slots.release()
+
+    @contextmanager
+    def operation(self):
+        # Waiting clients must recheck cancellation instead of executing a queued write.
+        deadline = time.monotonic() + 25.0
+        while not self._operations_lock.acquire(timeout=0.05):
+            if self.stopping.is_set():
+                raise ServerStoppingError("Server is stopping")
+            if time.monotonic() >= deadline:
+                raise ServerStoppingError("Server is busy. Retry after the current operation.")
+        try:
+            if self.stopping.is_set():
+                raise ServerStoppingError("Server is stopping")
+            yield
+        finally:
+            self._operations_lock.release()
+
+    def begin_shutdown(self):
+        self.stopping.set()
+        with self._connections_lock:
+            connections = list(self._connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def wait_workers(self, timeout: float | None = None) -> bool:
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            with self._connections_lock:
+                workers = list(self._workers)
+                has_connections = bool(self._connections)
+            if not workers and not has_connections:
+                return True
+            if not workers:
+                time.sleep(0.01)
+            for worker in workers:
+                remaining = max(0, deadline - time.monotonic()) if deadline is not None else None
+                worker.join(remaining)
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+
+    def server_close(self):
+        self.begin_shutdown()
+        super().server_close()
+        self.wait_workers(self.shutdown_timeout)
 
 
 class AgentRequestHandler(BaseHTTPRequestHandler):
     binary_ops: BinaryOperations
+    server: BoundedThreadingHTTPServer
+
+    def setup(self):
+        super().setup()
+        self._read_deadline = time.monotonic() + self.server.read_timeout
+        self._read_expired = False
+        self._read_timer = threading.Timer(self.server.read_timeout, self._expire_read)
+        self._read_timer.daemon = True
+        self._read_timer.start()
+
+    def _expire_read(self):
+        self._read_expired = True
+        try:
+            self.connection.shutdown(socket.SHUT_RD)
+        except OSError:
+            pass
+
+    def _finish_read(self):
+        self._read_timer.cancel()
+        if self._read_expired or time.monotonic() >= self._read_deadline:
+            raise TimeoutError("Request read deadline exceeded")
+
+    def finish(self):
+        self._read_timer.cancel()
+        try:
+            super().finish()
+        except OSError:
+            pass
+
+    def handle(self):
+        try:
+            super().handle()
+        except OSError:
+            # Peer disconnects and shutdown wakeups are normal socket lifecycle events.
+            pass
+
+    def _validate_client(self) -> None:
+        host = self.headers.get("Host", "")
+        parsed = urlparse("//" + host)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise RequestRejected("Invalid Host", 403) from error
+        if (
+            parsed.hostname not in ("localhost", "127.0.0.1", "::1")
+            or port != self.server.server_port
+        ):
+            raise RequestRejected("Local Host header with the server port is required", 403)
+        if self.headers.get("Origin") is not None:
+            raise RequestRejected("Browser-origin requests are not allowed", 403)
+        token = self.server.auth_token
+        if token and not hmac.compare_digest(
+            self.headers.get("Authorization", "").encode("utf-8"),
+            ("Bearer " + token).encode("utf-8"),
+        ):
+            raise RequestRejected("Authentication required", 401)
+
+    def _read_body(self, length: int) -> bytes:
+        chunks = []
+        remaining = length
+        while remaining:
+            timeout = self._read_deadline - time.monotonic()
+            if timeout <= 0:
+                raise TimeoutError("Request body deadline exceeded")
+            self.connection.settimeout(timeout)
+            chunk = self.rfile.read1(min(remaining, 8192))
+            if not chunk:
+                if self._read_expired:
+                    raise TimeoutError("Request body deadline exceeded")
+                raise ValueError("Incomplete JSON body")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
 
     def log_message(self, format: str, *args: Any) -> None:
         bn.log_info(format % args)
 
     def _send(self, data: dict[str, Any], status: int = 200) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
         try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             pass
 
     def _fail(self, error: Exception) -> None:
-        if isinstance(error, ConflictError):
+        if isinstance(error, RequestRejected):
+            self._send({"error": str(error)}, error.status)
+        elif isinstance(error, ServerStoppingError):
+            self._send({"error": str(error)}, 503)
+        elif isinstance(error, TimeoutError):
+            self._send({"error": str(error)}, 408)
+        elif isinstance(error, ConflictError):
             self._send({"error": str(error), "current": error.current}, 409)
         elif isinstance(error, LookupError):
             self._send({"error": str(error)}, 404)
@@ -115,25 +286,23 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         return value
 
     def _select(self, binary_id: str) -> None:
-        if binary_id not in self.binary_ops._views_by_id:
-            raise LookupError("Binary view is closed or unknown; call list_binaries")
-        if self.binary_ops.select_view(binary_id) is None:
-            raise LookupError("Binary view is closed or unknown; call list_binaries")
+        self.binary_ops = self.binary_ops.for_view(binary_id)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         params = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
         try:
+            self._validate_client()
+            self._finish_read()
             if path == "/binaries":
-                with self.binary_ops._view_lock:
-                    data = BinaryNinjaEndpoints(self.binary_ops).list_binaries()
+                data = BinaryNinjaEndpoints(self.binary_ops).list_binaries()
                 self._send(data)
                 return
             if not path.startswith("/agent/"):
                 raise LookupError("Unknown route")
             binary_id = self._required(params, "binaryId")
-            with self.binary_ops._view_lock:
+            with self.server.operation():
                 self._select(binary_id)
                 data = self._read(path, params)
             self._send({"binary_id": binary_id, **data})
@@ -239,16 +408,25 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            self._validate_client()
+            if (
+                self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                != "application/json"
+            ):
+                raise RequestRejected("Content-Type must be application/json", 415)
+            if self.headers.get("Transfer-Encoding") is not None:
+                raise RequestRejected("Transfer-Encoding is not supported", 400)
             if urlparse(self.path).path != "/agent/annotate":
                 raise LookupError("Unknown route")
             length = int(self.headers.get("Content-Length", "0"))
             if not 1 <= length <= 65536:
                 raise ValueError("JSON body must be 1..65536 bytes")
-            data = json.loads(self.rfile.read(length))
+            data = json.loads(self._read_body(length))
+            self._finish_read()
             if not isinstance(data, dict):
                 raise ValueError("JSON object required")
             binary_id = self._required(data, "binary_id")
-            with self.binary_ops._view_lock:
+            with self.server.operation():
                 self._select(binary_id)
                 result = self._annotate(data)
             self._send({"binary_id": binary_id, **result})
@@ -311,29 +489,64 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 class MCPServer:
     def __init__(self, config: Config):
         self.config = config
-        self.server: HTTPServer | None = None
+        self.server: BoundedThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.binary_ops = BinaryOperations(config.binary_ninja)
+        self._lifecycle_lock = threading.Lock()
+        self.stopping = False
 
     def start(self) -> None:
-        handler = type(
-            "AgentRequestHandlerWithOps", (AgentRequestHandler,), {"binary_ops": self.binary_ops}
-        )
-        self.server = BoundedThreadingHTTPServer(
-            (self.config.server.host, self.config.server.port), handler
-        )
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
+        with self._lifecycle_lock:
+            if self.server is not None or self.stopping:
+                raise RuntimeError("Server is already running or stopping")
+            if self.config.server.host not in ("localhost", "127.0.0.1"):
+                raise ValueError("HTTP server must bind to IPv4 loopback")
+            handler = type(
+                "AgentRequestHandlerWithOps",
+                (AgentRequestHandler,),
+                {"binary_ops": self.binary_ops},
+            )
+            self.server = BoundedThreadingHTTPServer(
+                (self.config.server.host, self.config.server.port),
+                handler,
+                read_timeout=self.config.server.read_timeout,
+                shutdown_timeout=self.config.server.shutdown_timeout,
+                auth_token=self.config.server.auth_token,
+            )
+            self.thread = threading.Thread(
+                target=self.server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True
+            )
+            self.thread.start()
         bn.log_info(
             f"Agent HTTP server started on {self.config.server.host}:{self.config.server.port}"
         )
 
+    def stop_async(self) -> None:
+        threading.Thread(target=self.stop, name="MCP server shutdown", daemon=True).start()
+
     def stop(self) -> None:
-        if self.server is not None:
-            self.server.shutdown()
-            self.server.server_close()
-            if self.thread is not None:
-                self.thread.join()
+        with self._lifecycle_lock:
+            if self.server is None or self.stopping:
+                return
+            self.stopping = True
+            server = self.server
+            thread = self.thread
+            server.begin_shutdown()
+        server.shutdown()
+        server.server_close()
+        if thread is not None:
+            thread.join(timeout=1.0)
+        # An SDK call already running cannot be forcibly interrupted. Keep the
+        # lifecycle in Stopping until it exits to prevent overlapping restarts.
+        if not server.wait_workers(0):
+            threading.Thread(target=self._finish_stop, args=(server,), daemon=True).start()
+        else:
+            self._finish_stop(server)
+
+    def _finish_stop(self, server: BoundedThreadingHTTPServer) -> None:
+        server.wait_workers()
+        with self._lifecycle_lock:
             self.thread = None
             self.server = None
-            bn.log_info("Agent HTTP server stopped")
+            self.stopping = False
+        bn.log_info("Agent HTTP server stopped")

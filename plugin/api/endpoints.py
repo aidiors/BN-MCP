@@ -25,43 +25,31 @@ class BinaryNinjaEndpoints:
         return self.binary_ops.get_entry_points()
 
     def _format_binary_listing(self, raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Normalize binary listing entries with ordinal, view id, basename, and selectors."""
+        """List stable view IDs with paths and view types."""
         formatted: list[dict[str, Any]] = []
-        for ordinal, item in enumerate(raw, start=1):
+        for item in raw:
             filename = item.get("filename")
             view_id = str(item.get("id") or "")
             basename = os.path.basename(filename) if filename else None
             entry: dict[str, Any] = {
-                "id": str(ordinal),
+                "id": view_id,
                 "view_id": view_id,
                 "filename": filename,
                 "basename": basename,
                 "active": bool(item.get("active")),
+                "view_type": item.get("view_type"),
             }
-            selectors: list[str] = []
-            for candidate in (
-                entry["id"],
-                view_id,
-                filename,
-                basename,
-            ):
-                if candidate and candidate not in selectors:
-                    selectors.append(candidate)
-            entry["selectors"] = selectors
+            entry["selectors"] = [view_id] if view_id else []
             formatted.append(entry)
         return formatted
 
     def list_binaries(self) -> dict[str, Any]:
-        """List managed/open binaries with sequential ids (1..N) and active flag.
-
-        The server maintains internal keys for views; this endpoint presents
-        a user-friendly, 1-based index stable under sorting by filename.
-        """
+        """List concrete managed views with stable IDs and the UI active flag."""
         raw = self.binary_ops.list_open_binaries()
         return {"binaries": self._format_binary_listing(raw)}
 
     def select_binary(self, ident: str) -> dict[str, Any]:
-        """Select active binary by id or filename/basename."""
+        """Select an active view by its stable view_id."""
         info = self.binary_ops.select_view(ident)
         if not info:
             return {
@@ -73,9 +61,7 @@ class BinaryNinjaEndpoints:
         formatted = self._format_binary_listing(self.binary_ops.list_open_binaries())
         selected_entry: dict[str, Any] | None = None
         for entry in formatted:
-            if (filename and entry.get("filename") == filename) or (
-                view_id and entry.get("view_id") == view_id
-            ):
+            if view_id and entry.get("view_id") == view_id:
                 selected_entry = entry
                 break
         if not selected_entry:
@@ -113,45 +99,10 @@ class BinaryNinjaEndpoints:
         return self.binary_ops.get_callees(identifiers)
 
     def get_imports(self, offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:
-        """Get list of imported functions"""
-        if not self.binary_ops.current_view:
-            raise RuntimeError("No binary loaded")
-
-        imports = []
-        for sym in self.binary_ops.current_view.get_symbols_of_type(
-            bn.SymbolType.ImportedFunctionSymbol
-        ):
-            imports.append(
-                {
-                    "name": sym.name,
-                    "address": hex(sym.address),
-                    "raw_name": sym.raw_name if hasattr(sym, "raw_name") else sym.name,
-                    "full_name": sym.full_name if hasattr(sym, "full_name") else sym.name,
-                }
-            )
-        return imports[offset : offset + limit]
+        return self.binary_ops.get_symbols_page("imports", offset, limit)["imports"]
 
     def get_exports(self, offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:
-        """Get list of exported symbols"""
-        if not self.binary_ops.current_view:
-            raise RuntimeError("No binary loaded")
-
-        exports = []
-        for sym in self.binary_ops.current_view.get_symbols():
-            if sym.type not in [
-                bn.SymbolType.ImportedFunctionSymbol,
-                bn.SymbolType.ExternalSymbol,
-            ]:
-                exports.append(
-                    {
-                        "name": sym.name,
-                        "address": hex(sym.address),
-                        "raw_name": sym.raw_name if hasattr(sym, "raw_name") else sym.name,
-                        "full_name": sym.full_name if hasattr(sym, "full_name") else sym.name,
-                        "type": str(sym.type),
-                    }
-                )
-        return exports[offset : offset + limit]
+        return self.binary_ops.get_symbols_page("exports", offset, limit)["exports"]
 
     def get_namespaces(self, offset: int = 0, limit: int = 100) -> list[str]:
         """Get list of C++ namespaces"""
@@ -448,7 +399,7 @@ class BinaryNinjaEndpoints:
                 pairs.append({"old": str(old), "new": str(new)})
         else:
             raise ValueError(
-                "Invalid 'renames' format; expected list of {old,new} or mapping old->new"
+                "Invalid 'renames' format. Expected a list of {old,new} or an old->new mapping."
             )
 
         if not pairs:
@@ -791,111 +742,41 @@ class BinaryNinjaEndpoints:
             "applied_type": applied,
         }
 
+    @staticmethod
+    def _stack_variable(var: Any) -> dict[str, str]:
+        storage = getattr(var, "storage", 0)
+        variable_type = getattr(var, "type", None)
+        width = getattr(variable_type, "width", getattr(var, "width", 0))
+        return {
+            "name": str(getattr(var, "name", "")),
+            "offset": f"{storage:#x}" if isinstance(storage, int) else str(storage),
+            "size": f"{width:#x}" if isinstance(width, int) else str(width),
+            "type": str(variable_type) if variable_type is not None else "",
+        }
+
     def get_stack_frame_vars(self, function_identifier: str | int) -> list[dict[str, Any]]:
-        """Get stack frame variable information for a function.
-
-        Returns information about local variables in the function's stack frame,
-        including their names, offsets, sizes, and types.
-
-        Args:
-            function_identifier: Function name or address
-
-        Returns:
-            List of dictionaries with stack frame information:
-            [
-                {
-                    "addr": "0x401000",
-                    "vars": [
-                        {
-                            "name": "buf",
-                            "offset": "-0x10",
-                            "size": "0x10",
-                            "type": "char[16]"
-                        },
-                        {
-                            "name": "len",
-                            "offset": "-0x4",
-                            "size": "0x4",
-                            "type": "int"
-                        }
-                    ]
-                }
-            ]
-
-        Raises:
-            RuntimeError: If no binary is loaded
-            ValueError: If the function is not found
-        """
-        if not self.binary_ops.current_view:
-            raise RuntimeError("No binary loaded")
-
-        func = self.binary_ops.get_function_by_name_or_address(function_identifier)
-        if not func:
-            raise ValueError(f"Function '{function_identifier}' not found")
-
-        result = []
-
-        stack_layout = []
-        if hasattr(func, "stack_layout"):
-            stack_layout = func.stack_layout
-        elif hasattr(func, "vars"):
-            stack_layout = func.vars
-        else:
-            raise RuntimeError(
-                f"Function '{function_identifier}' has no stack information available"
-            )
-
-        vars_list = []
-        for var in stack_layout:
-            try:
-                var_info = {
-                    "name": getattr(var, "name", ""),
-                    "offset": "0x0",
-                    "size": "0x0",
-                    "type": "",
-                }
-
-                if hasattr(var, "storage"):
-                    storage = var.storage
-                    if storage is not None:
-                        if isinstance(storage, int):
-                            var_info["offset"] = f"{storage:#x}"
-                        else:
-                            var_info["offset"] = str(storage)
-
-                if hasattr(var, "type") and var.type is not None:
-                    var_info["type"] = str(var.type)
-                    try:
-                        if hasattr(var.type, "width"):
-                            var_info["size"] = f"{var.type.width:#x}"
-                    except Exception:
-                        var_info["size"] = "0x0"
-
-                if var_info["size"] == "0x0" and hasattr(var, "width"):
-                    var_info["size"] = f"{var.width:#x}"
-
-                vars_list.append(var_info)
-
-            except Exception as e:
-                bn.log_error(f"Error processing variable {getattr(var, 'name', '<unknown>')}: {e}")
-                continue
-
-        result.append({"addr": hex(func.start), "vars": vars_list})
-
-        return result
+        function = self.binary_ops.get_function_by_name_or_address(function_identifier)
+        if function is None:
+            raise LookupError("Function not found")
+        layout = getattr(function, "stack_layout", None)
+        if layout is None:
+            raise RuntimeError("Function has no stack information available")
+        return [
+            {"addr": hex(function.start), "vars": [self._stack_variable(var) for var in layout]}
+        ]
 
     def get_stack_frame_page(
         self, function_identifier: str | int, offset: int = 0, limit: int = 100
     ) -> dict[str, Any]:
-        if offset < 0 or not 1 <= limit <= 200:
-            raise ValueError("offset must be >= 0 and limit must be 1..200")
-        frame = self.get_stack_frame_vars(function_identifier)[0]
-        info = self.binary_ops.get_function_info(function_identifier)
-        if info is None:
-            raise ValueError(f"Function '{function_identifier}' not found")
+        function = self.binary_ops.get_function_by_name_or_address(function_identifier)
+        if function is None:
+            raise LookupError("Function not found")
+        layout = getattr(function, "stack_layout", None)
+        if layout is None:
+            raise RuntimeError("Function has no stack information available")
         return {
-            "function": {"name": info["name"], "address": info["address"]},
-            **page_items(frame["vars"], offset, limit, lambda variable: variable, "variables"),
+            "function": {"name": function.name, "address": hex(function.start)},
+            **page_items(layout, offset, limit, self._stack_variable, "variables"),
         }
 
     def patch_bytes(

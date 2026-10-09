@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -6,6 +7,11 @@ class ServerConfig:
     host: str = "localhost"
     port: int = 9009
     debug: bool = False
+    read_timeout: float = 5.0
+    shutdown_timeout: float = 1.0
+    auth_token: str = field(
+        repr=False, default_factory=lambda: os.environ.get("BINJA_MCP_TOKEN", "")
+    )
 
 
 @dataclass

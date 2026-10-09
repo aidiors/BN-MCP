@@ -1,3 +1,5 @@
+import os
+
 import binaryninja as bn
 from binaryninja import Settings
 
@@ -14,13 +16,17 @@ def _apply_settings_to_config():
 
         port_str = settings.get_string("mcp.port")
         if port_str:
-            try:
-                plugin.config.server.port = int(port_str)
-            except ValueError:
-                pass
+            port = int(port_str)
+            if not 1 <= port <= 65535:
+                raise ValueError("MCP port must be between 1 and 65535")
+            plugin.config.server.port = port
+
+        token = settings.get_string("mcp.authToken")
+        plugin.config.server.auth_token = token or os.environ.get("BINJA_MCP_TOKEN", "")
 
     except Exception as e:
         bn.log_error(f"Failed to apply settings to config: {e}")
+        raise
 
 
 _mcp_user_stopped = False
@@ -36,23 +42,18 @@ class BinaryNinjaMCP:
             _apply_settings_to_config()
 
             if bv is None:
-                bn.log_debug("MCP Max start requested but no BinaryView is active; deferring")
+                bn.log_debug("MCP Max start deferred until a BinaryView is active")
                 _show_no_bv_popup()
                 return
             if self.server and self.server.server:
-                bn.log_info("MCP Max server already running; skip new start")
-                if self.server.binary_ops.current_view is None:
-                    self.server.binary_ops.current_view = bv
-                else:
-                    try:
-                        self.server.binary_ops.register_view(bv)
-                    except Exception:
-                        pass
+                bn.log_info("MCP Max server is already running")
+                self.server.binary_ops.current_view = bv
+                self.server.binary_ops.register_view(bv, keep_alive=True)
                 _show_popup("MCP Server", "Server is already running.")
                 return
             self.server.binary_ops.current_view = bv
             try:
-                self.server.binary_ops.register_view(bv)
+                self.server.binary_ops.register_view(bv, keep_alive=True)
             except Exception:
                 pass
             self.server.start()
@@ -78,11 +79,12 @@ class BinaryNinjaMCP:
                 return
             global _mcp_user_stopped
             _mcp_user_stopped = True
-            self.server.binary_ops.current_view = None
-            self.server.stop()
-            bn.log_info("Binary Ninja MCP Max plugin stopped successfully")
+            self.server.stop_async()
             _set_status_indicator(False)
-            _show_popup("MCP Server Stopped", "Server has been stopped.")
+            _show_popup(
+                "MCP Server Stopping",
+                "Closing connections and waiting for any running SDK operation.",
+            )
         except Exception as e:
             bn.log_error(f"Failed to stop server: {e!s}")
             _show_popup("MCP Server Error", f"Failed to stop: {e}")
@@ -97,6 +99,10 @@ def _register_settings():
     settings.register_setting(
         "mcp.showStatusButton",
         '{ "title": "Show Status Button", "type": "boolean", "default": true, "description": "Show MCP server status button in the status bar." }',
+    )
+    settings.register_setting(
+        "mcp.authToken",
+        '{"title": "HTTP Authentication Token", "type": "string", "default": "", "description": "Optional shared token. Set BINJA_MCP_TOKEN on the bridge to the same value."}',
     )
     settings.register_setting(
         "mcp.port",
@@ -119,7 +125,7 @@ def _try_autostart_for_bv(bv):
 
 
 def _show_popup(title: str, text: str, info: bool = True):
-    """Disable UI popups; log message instead.
+    """Log messages without UI popups.
 
     This keeps the UX unobtrusive while preserving visibility in the log.
     """
@@ -304,7 +310,9 @@ def _set_status_indicator(running: bool):
             _ensure_status_indicator()
             if _status_button is None:
                 return
-            if running:
+            if plugin.server.stopping:
+                _status_button.setText("MCP: Stopping")
+            elif running:
                 _status_button.setText("MCP: Running")
                 _status_button.setStyleSheet(
                     "margin:0; padding:0 6px; border:0; border-radius:1px;"
@@ -326,7 +334,7 @@ def _set_status_indicator(running: bool):
 def _start_indicator_watcher():
     """Periodically ensure the indicator exists after UI becomes ready.
 
-    Some environments initialize UI context late; this watcher is a light
+    Some environments initialize UI context late. This watcher is a light
     safety net that creates and updates the indicator shortly after load.
     It stops itself once the indicator exists.
     """
@@ -408,81 +416,13 @@ def _start_bv_monitor():
             return
 
         def _discover_all_open_bvs(ops):
-            """Heuristically discover all open BinaryViews from UI and sync registry.
+            # Retain GUI wrappers until the actual FileContext close notification.
+            # SDK calls can return fresh Python wrappers for the same native view.
+            from binaryninjaui import FileContext
 
-            Attempts multiple UI paths defensively; safe if some APIs are unavailable.
-            """
-            try:
-                from binaryninjaui import UIContext
-            except Exception:
-                UIContext = None
-
-            found_fns: set[str] = set()
-            found_bvs: list = []
-            contexts = []
-            try:
-                if UIContext and hasattr(UIContext, "allContexts"):
-                    contexts = list(UIContext.allContexts())
-            except Exception:
-                contexts = []
-            if not contexts and UIContext:
-                try:
-                    ctx = UIContext.activeContext()
-                    if ctx:
-                        contexts = [ctx]
-                except Exception:
-                    contexts = []
-
-            def _collect_from_frame(vf):
-                try:
-                    if vf and hasattr(vf, "getCurrentBinaryView"):
-                        bv = vf.getCurrentBinaryView()
-                        if bv:
-                            found_bvs.append(bv)
-                except Exception:
-                    pass
-                try:
-                    if vf and hasattr(vf, "getBinaryView"):
-                        bv2 = vf.getBinaryView()
-                        if bv2:
-                            found_bvs.append(bv2)
-                except Exception:
-                    pass
-
-            for ctx in contexts:
-                try:
-                    vf = ctx.getCurrentViewFrame()
-                    _collect_from_frame(vf)
-                except Exception:
-                    pass
-                for attr in ("getViewFrames", "viewFrames", "allViewFrames", "frames"):
-                    try:
-                        getter = getattr(ctx, attr, None)
-                        frames = None
-                        if callable(getter):
-                            frames = getter()
-                        elif getter is not None:
-                            frames = getter
-                        if frames:
-                            for vf2 in list(frames):
-                                _collect_from_frame(vf2)
-                    except Exception:
-                        continue
-
-            for bv in found_bvs:
-                try:
-                    ops.register_view(bv)
-                    fn = None
-                    try:
-                        if getattr(bv, "file", None):
-                            fn = getattr(bv.file, "filename", None)
-                    except Exception:
-                        fn = None
-                    if fn:
-                        found_fns.add(str(fn))
-                except Exception:
-                    continue
-            return found_fns
+            for file in FileContext.getOpenFileContexts():
+                for view in file.getAllDataViews():
+                    ops.register_view(view, keep_alive=True)
 
         def _tick():
             try:
@@ -494,34 +434,28 @@ def _start_bv_monitor():
                 if not ops:
                     return
 
+                _set_status_indicator(bool(plugin.server.server))
                 try:
                     ops.list_open_binaries()
                 except Exception:
                     pass
 
                 try:
-                    _discover_all_open_bvs(ops) or set()
+                    _discover_all_open_bvs(ops)
                 except Exception:
                     pass
 
                 try:
-                    if ops.current_view is None:
-                        try:
-                            from binaryninjaui import UIContext
+                    from binaryninjaui import UIContext
 
-                            act_ctx = UIContext.activeContext()
-                            act_bv = None
-                            if act_ctx:
-                                vf = act_ctx.getCurrentViewFrame()
-                                if vf and hasattr(vf, "getCurrentBinaryView"):
-                                    act_bv = vf.getCurrentBinaryView()
-                            ops.current_view = act_bv
-                            if act_bv:
-                                ops.register_view(act_bv)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                    context = UIContext.activeContext()
+                    frame = context.getCurrentViewFrame() if context else None
+                    active_view = frame.getCurrentBinaryView() if frame else None
+                    ops.current_view = active_view
+                    if active_view is not None:
+                        ops.register_view(active_view, keep_alive=True)
+                except Exception as error:
+                    bn.log_debug(f"MCP could not synchronize active view: {error}")
             except Exception:
                 pass
 
@@ -552,68 +486,47 @@ try:
             super().__init__()
             ui.UIContext.registerNotification(self)
 
-        def _get_active_bv(self):
+        def OnViewChange(self, context, frame, view_type):
             try:
-                ctx = ui.UIContext.activeContext()
-                if ctx:
-                    vf = ctx.getCurrentViewFrame()
-                    if vf and hasattr(vf, "getCurrentBinaryView"):
-                        return vf.getCurrentBinaryView()
-            except Exception:
-                pass
-            return None
-
-        def OnViewChange(self, *args):
-            try:
-                bv = self._get_active_bv()
+                bv = frame.getCurrentBinaryView() if frame else None
                 _ensure_status_indicator()
                 _set_status_indicator(bool(plugin.server and plugin.server.server))
                 _start_indicator_watcher()
                 _start_bv_monitor()
                 if bv:
                     try:
-                        plugin.server.binary_ops.register_view(bv)
+                        plugin.server.binary_ops.register_view(bv, keep_alive=True)
                     except Exception:
                         pass
                     _try_autostart_for_bv(bv)
             except Exception as e:
                 bn.log_error(f"MCP Max UI notification error: {e}")
 
-        def OnAfterOpenFile(self, *args):
+        def OnAfterOpenFile(self, context, file, frame):
             try:
-                bv = self._get_active_bv()
+                bv = frame.getCurrentBinaryView() if frame else None
                 _ensure_status_indicator()
                 _set_status_indicator(bool(plugin.server and plugin.server.server))
                 _start_indicator_watcher()
                 _start_bv_monitor()
                 if bv:
                     try:
-                        plugin.server.binary_ops.register_view(bv)
+                        plugin.server.binary_ops.register_view(bv, keep_alive=True)
                     except Exception:
                         pass
                     _try_autostart_for_bv(bv)
             except Exception as e:
                 bn.log_error(f"MCP Max OnAfterOpenFile error: {e}")
 
-        def OnBeforeCloseFile(self, *args):
-            try:
-                bv = self._get_active_bv()
-                if bv and plugin.server and plugin.server.binary_ops:
-                    try:
-                        fn = getattr(bv.file, "filename", None)
-                    except Exception:
-                        fn = None
-                    if fn:
-                        plugin.server.binary_ops.unregister_by_filename(fn)
-            except Exception:
-                pass
+        def OnBeforeCloseFile(self, context, file, frame):
+            return True
 
-        def OnAfterCloseFile(self, *args):
+        def OnAfterCloseFile(self, context, file, frame):
             try:
-                if plugin.server and plugin.server.binary_ops:
-                    _ = plugin.server.binary_ops.list_open_binaries()
-            except Exception:
-                pass
+                metadata = file.getMetadata()
+                plugin.server.binary_ops.unregister_file(metadata)
+            except Exception as error:
+                bn.log_error(f"MCP could not unregister closed file: {error}")
 
         def OnContextOpen(self, *args):
             try:

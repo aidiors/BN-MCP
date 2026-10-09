@@ -6,6 +6,7 @@ contracts can be checked without starting Binary Ninja.
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 from collections.abc import Iterable
 from itertools import chain, islice
@@ -169,28 +170,33 @@ def page_functions(view: Any, query: str = "", offset: int = 0, limit: int = 100
 def page_strings(view: Any, query: str = "", offset: int = 0, limit: int = 100) -> dict[str, Any]:
     if view is None:
         raise RuntimeError("No binary loaded")
-    try:
-        strings = view.get_strings()
-    except (AttributeError, TypeError):
-        strings = view.strings
-
-    def convert(ref: Any) -> dict[str, Any]:
-        address = getattr(ref, "start", getattr(ref, "address", None))
-        length = getattr(ref, "length", None)
-        value = getattr(ref, "value", None)
-        if value is None and address is not None and length is not None:
-            raw = view.read(address, min(length, 4096)) or b""
-            value = raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-        value = str(value or "")
-        return {
-            "address": _hex(address),
-            "length": length,
-            "type": str(getattr(ref, "type", "")),
-            "value": value[:4096],
-            "value_truncated": len(value) > 4096,
-        }
-
-    rows, more = _page_matches(strings, offset, limit, query, convert)
+    if offset < 0 or not 1 <= limit <= 200:
+        raise ValueError("offset must be >= 0 and limit must be 1..200")
+    rows = []
+    seen = 0
+    more = False
+    for ref in _string_references(view):
+        if not query and seen < offset:
+            seen += 1
+            continue
+        value, truncated, matches = _string_value(view, ref, query)
+        if not matches:
+            continue
+        if seen < offset:
+            seen += 1
+            continue
+        if len(rows) == limit:
+            more = True
+            break
+        rows.append(
+            {
+                "address": _hex(getattr(ref, "start", getattr(ref, "address", None))),
+                "length": getattr(ref, "length", None),
+                "type": str(getattr(ref, "type", "")),
+                "value": value,
+                "value_truncated": truncated,
+            }
+        )
     return {
         "strings": rows,
         "query": query,
@@ -199,6 +205,90 @@ def page_strings(view: Any, query: str = "", offset: int = 0, limit: int = 100) 
         "next_offset": offset + len(rows) if more else None,
         "truncated": more,
     }
+
+
+def _string_references(view: Any) -> Iterable[Any]:
+    """Fetch SDK references in bounded address windows instead of one full list."""
+    getter = getattr(view, "get_strings", None)
+    if not callable(getter):
+        yield from view.strings
+        return
+    start, end = getattr(view, "start", None), getattr(view, "end", None)
+    if start is None or end is None:
+        yield from getter()
+        return
+    spans = sorted(
+        (int(segment.start), int(segment.end))
+        for segment in getattr(view, "segments", ())
+        if segment.end > segment.start
+    )
+    if not spans:
+        spans = [(int(start), int(end))]
+    previous_end = int(start)
+    for span_start, span_end in spans:
+        cursor = max(span_start, previous_end)
+        while cursor < span_end:
+            length = min(65536, span_end - cursor)
+            refs = getter(cursor, length)
+            for ref in refs:
+                # SDK range queries may also return an overlapping earlier string.
+                if cursor <= ref.start < cursor + length:
+                    yield ref
+            cursor += length
+        previous_end = max(previous_end, span_end)
+
+
+def _string_value(view: Any, ref: Any, query: str) -> tuple[str, bool, bool]:
+    """Bound display reads, but search the entire decoded value incrementally."""
+    needle = query.casefold()
+    address = getattr(ref, "start", getattr(ref, "address", None))
+    length = getattr(ref, "length", None)
+    reader = getattr(view, "read", None)
+    # Lightweight non-SDK adapters may expose only an already-decoded value.
+    if address is None or length is None or not callable(reader):
+        value = getattr(ref, "value", None)
+        if value is not None:
+            value = str(value)
+            return value[:4096], len(value) > 4096, needle in value.casefold()
+    if address is None or length is None or not callable(reader):
+        raise ValueError("String reference has neither a decoded value nor readable storage")
+    address, length = int(address), int(length)
+    type_name = getattr(getattr(ref, "type", None), "name", str(getattr(ref, "type", ""))).lower()
+    big_endian = "big" in str(getattr(getattr(view, "endianness", None), "name", "")).lower()
+    codec = "utf-8"
+    if "utf16" in type_name:
+        codec = "utf-16-be" if big_endian else "utf-16-le"
+    elif "utf32" in type_name:
+        codec = "utf-32-be" if big_endian else "utf-32-le"
+    elif "ascii" in type_name:
+        codec = "ascii"
+    decoder = None
+    prefix = ""
+    tail = ""
+    matched = not needle
+    consumed = 0
+    while consumed < int(length or 0):
+        raw = reader(address + consumed, min(4096, length - consumed)) or b""
+        if not raw:
+            break
+        if decoder is None:
+            if "utf16" in type_name and raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+                codec = "utf-16"
+            elif "utf32" in type_name and raw.startswith(
+                (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")
+            ):
+                codec = "utf-32"
+            decoder = codecs.getincrementaldecoder(codec)(errors="replace")
+        consumed += len(raw)
+        text = decoder.decode(raw, final=consumed >= length)
+        prefix += text[: max(0, 4097 - len(prefix))]
+        if not matched:
+            search = tail + text.casefold()
+            matched = needle in search
+            tail = search[-(len(needle) - 1) :] if len(needle) > 1 else ""
+        if len(prefix) > 4096 and matched:
+            break
+    return prefix[:4096], len(prefix) > 4096, matched
 
 
 def page_symbols(

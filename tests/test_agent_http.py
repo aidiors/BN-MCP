@@ -1,147 +1,148 @@
-import importlib.util
-import io
-import json
-import sys
+import socket
 import threading
-import types
+import time
 import unittest
-from pathlib import Path
-from types import SimpleNamespace as Obj
+from concurrent.futures import ThreadPoolExecutor
 
-
-def load_server_without_binary_ninja():
-    root = Path(__file__).resolve().parents[1]
-    for name in ("plugin", "plugin.api", "plugin.core", "plugin.server"):
-        package = types.ModuleType(name)
-        package.__path__ = [str(root / name.replace(".", "/"))]
-        sys.modules[name] = package
-    bn = types.ModuleType("binaryninja")
-    setattr(bn, "log_info", lambda *_: None)
-    setattr(bn, "log_error", lambda *_: None)
-    sys.modules["binaryninja"] = bn
-    endpoints = types.ModuleType("plugin.api.endpoints")
-
-    class FakeEndpoints:
-        def __init__(self, operations):
-            self.operations = operations
-
-        def list_binaries(self):
-            return {"binaries": [{"view_id": "7"}]}
-
-        def get_entry_points(self):
-            return []
-
-        def get_imports(self, offset, limit):
-            return []
-
-        def get_exports(self, offset, limit):
-            return []
-
-    setattr(endpoints, "BinaryNinjaEndpoints", FakeEndpoints)
-    sys.modules[endpoints.__name__] = endpoints
-    operations = types.ModuleType("plugin.core.binary_operations")
-    setattr(operations, "BinaryOperations", object)
-    sys.modules[operations.__name__] = operations
-    config = types.ModuleType("plugin.core.config")
-    setattr(config, "Config", object)
-    sys.modules[config.__name__] = config
-    path = root / "plugin" / "server" / "agent_http_server.py"
-    spec = importlib.util.spec_from_file_location("plugin.server.agent_http_server", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-server = load_server_without_binary_ninja()
-
-
-class FakeOperations:
-    def __init__(self):
-        self._view_lock = threading.RLock()
-        self._views_by_id = {"7": object()}
-        self.current_view = Obj(is_valid_offset=lambda _: True)
-        self.selected = None
-        self.comment = None
-
-    def select_view(self, binary_id):
-        self.selected = binary_id
-        return {"id": binary_id}
-
-    def get_functions_page(self, query, offset, limit):
-        return {
-            "functions": [],
-            "query": query,
-            "offset": offset,
-            "limit": limit,
-            "next_offset": None,
-            "truncated": False,
-        }
-
-    def get_comment(self, address):
-        return self.comment
-
-    def set_comment(self, address, comment):
-        self.comment = comment or None
-        return True
+from agent_test_support import FakeView, HTTPFixture
 
 
 class HandlerTests(unittest.TestCase):
     def setUp(self):
-        self.operations = FakeOperations()
-        self.handler = server.AgentRequestHandler.__new__(server.AgentRequestHandler)
-        self.handler.binary_ops = self.operations
-        self.responses = []
-        self.handler._send = lambda data, status=200: self.responses.append((status, data))
+        self.fixture = HTTPFixture()
+        self.addCleanup(self.fixture.close)
+        self.view = FakeView()
+        self.ops = self.fixture.mcp.binary_ops
+        self.view_id = self.ops.register_view(self.view)
 
-    def test_get_is_bound_to_explicit_binary(self):
-        self.handler.path = "/agent/functions?binaryId=7&limit=2"
-        self.handler.do_GET()
-        status, data = self.responses[-1]
-        self.assertEqual(status, 200)
-        self.assertEqual(data["binary_id"], "7")
-        self.assertEqual(self.operations.selected, "7")
-        self.assertEqual(data["limit"], 2)
-
-    def test_missing_or_closed_binary_is_an_error(self):
-        self.handler.path = "/agent/functions?binaryId=8"
-        self.handler.do_GET()
-        self.assertEqual(self.responses[-1][0], 404)
-        self.assertIsNone(self.operations.selected)
-
-    def test_annotation_conflict_does_not_write(self):
+    def annotate(self, **changes):
         body = {
-            "binary_id": "7",
-            "action": "set_comment",
-            "address": "0x1000",
-            "expected_comment": "stale",
-            "comment": "new",
-        }
-        encoded = json.dumps(body).encode()
-        self.handler.path = "/agent/annotate"
-        self.handler.headers = {"Content-Length": str(len(encoded))}
-        self.handler.rfile = io.BytesIO(encoded)
-        self.handler.do_POST()
-        self.assertEqual(self.responses[-1][0], 409)
-        self.assertIsNone(self.operations.comment)
-
-    def test_annotation_success_reports_binary(self):
-        body = {
-            "binary_id": "7",
+            "binary_id": self.view_id,
             "action": "set_comment",
             "address": "0x1000",
             "expected_comment": None,
             "comment": "new",
         }
-        encoded = json.dumps(body).encode()
-        self.handler.path = "/agent/annotate"
-        self.handler.headers = {"Content-Length": str(len(encoded))}
-        self.handler.rfile = io.BytesIO(encoded)
-        self.handler.do_POST()
-        self.assertEqual(self.responses[-1][0], 200)
-        self.assertEqual(self.responses[-1][1]["binary_id"], "7")
-        self.assertEqual(self.operations.comment, "new")
+        body.update(changes)
+        return self.fixture.request("POST", "/agent/annotate", body)
+
+    def test_get_is_bound_to_explicit_binary(self):
+        status, data = self.fixture.request(
+            "GET", f"/agent/functions?binaryId={self.view_id}&limit=2"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["binary_id"], self.view_id)
+        self.assertEqual(data["limit"], 2)
+
+    def test_missing_or_closed_binary_is_an_error(self):
+        status, _ = self.fixture.request("GET", "/agent/functions?binaryId=unknown")
+        self.assertEqual(status, 404)
+
+    def test_annotation_conflict_does_not_write(self):
+        status, _ = self.annotate(expected_comment="stale")
+        self.assertEqual(status, 409)
+        self.assertFalse(self.view.comments)
+
+    def test_annotation_success_reports_binary(self):
+        status, data = self.annotate()
+        self.assertEqual(status, 200)
+        self.assertEqual(data["binary_id"], self.view_id)
+        self.assertEqual(self.view.comments[0x1000], "new")
+
+    def test_concurrent_annotations_only_one_wins(self):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            statuses = list(
+                pool.map(lambda text: self.annotate(comment=text)[0], ["first", "second"])
+            )
+        self.assertEqual(sorted(statuses), [200, 409])
+
+    def test_browser_origin_and_non_json_are_rejected(self):
+        body = {
+            "binary_id": self.view_id,
+            "action": "set_comment",
+            "address": "0x1000",
+            "expected_comment": None,
+            "comment": "untrusted",
+        }
+        status, _ = self.fixture.request(
+            "POST", "/agent/annotate", body, {"Origin": "https://untrusted.example"}
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.fixture.request(
+            "POST", "/agent/annotate", body, {"Content-Type": "text/plain"}
+        )
+        self.assertEqual(status, 415)
+        status, _ = self.fixture.request("GET", "/binaries", headers={"Host": "untrusted.example"})
+        self.assertEqual(status, 403)
+        self.assertFalse(self.view.comments)
+
+    def test_token_is_required_when_configured(self):
+        self.fixture.http.auth_token = "test-only-token"
+        status, _ = self.fixture.request("GET", "/binaries")
+        self.assertEqual(status, 401)
+        status, _ = self.fixture.request(
+            "GET", "/binaries", headers={"Authorization": "Bearer test-only-token"}
+        )
+        self.assertEqual(status, 200)
+
+    def test_incomplete_body_does_not_prevent_shutdown(self):
+        client = socket.create_connection(("127.0.0.1", self.fixture.port), timeout=2)
+        self.addCleanup(client.close)
+        client.sendall(
+            (
+                f"POST /agent/annotate HTTP/1.1\r\nHost: 127.0.0.1:{self.fixture.port}\r\n"
+                "Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{"
+            ).encode()
+        )
+        stopped = threading.Event()
+
+        def stop():
+            self.fixture.mcp.stop()
+            stopped.set()
+
+        thread = threading.Thread(target=stop, daemon=True)
+        thread.start()
+        self.assertTrue(stopped.wait(1.5))
+        self.assertTrue(self.fixture.http.wait_workers(1))
+
+    def test_partial_headers_have_absolute_deadline(self):
+        client = socket.create_connection(("127.0.0.1", self.fixture.port), timeout=2)
+        self.addCleanup(client.close)
+        client.sendall(b"GET /binaries HTTP/1.1\r\nX-Drip: ")
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            try:
+                client.sendall(b"x")
+            except OSError:
+                break
+            time.sleep(0.05)
+        self.assertTrue(self.fixture.http.wait_workers(0.5))
+
+    def test_shutdown_cancels_queued_annotation(self):
+        lock = self.fixture.http._operations_lock
+        lock.acquire()
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending = pool.submit(self.annotate)
+                deadline = time.monotonic() + 1
+                while not self.fixture.http._connections and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.fixture.http.begin_shutdown()
+                lock.release()
+                try:
+                    pending.result(timeout=2)
+                except (OSError, ConnectionError):
+                    pass
+        finally:
+            if lock.locked():
+                lock.release()
+        self.assertFalse(self.view.comments)
+
+    def test_registry_stays_responsive_during_a_serialized_operation(self):
+        with self.fixture.http._operations_lock:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                rows = pool.submit(self.ops.list_open_binaries).result(timeout=0.5)
+                self.assertEqual(rows[0]["id"], self.view_id)
 
 
 if __name__ == "__main__":

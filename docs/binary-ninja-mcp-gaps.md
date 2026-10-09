@@ -1,39 +1,37 @@
-# Функциональные пробелы Binary Ninja MCP
+# Binary Ninja MCP feature gaps
 
-Сверка выполнена 25 сентября 2026 года по текущему MCP-интерфейсу репозитория и опубликованным руководству и Python API Binary Ninja. Документация Binary Ninja предупреждает, что точный список встроенных MCP-инструментов меняется; ниже сравниваются описанные категории возможностей, а не конкретная версия сервера.
+This comparison was made on September 25, 2026 using this repository, the Binary Ninja user guide and the Python API documentation. It compares feature categories. Binary Ninja's built-in MCP tool list can change between releases.
 
-## Что уже доступно
+## Available tools
 
-В [bridge/src/agent_tools.ts](../bridge/src/agent_tools.ts) зарегистрирован 21 MCP-инструмент: выбор открытого BinaryView, сведения о бинарнике, поиск функций и строк, метаданные функции, callers/callees, HLIL/MLIL/LLIL с SSA для MLIL/LLIL, дизассемблирование, декомпилированный вывод, basic blocks/CFG, stack frame, xrefs, чтение байтов, entry points, sections/segments, imports/exports, чтение комментария, переименование функции и запись комментария. Все запросы бинарника принимают `binary_id`; ответы ограничены страницами.
+[bridge/src/agent_tools.ts](../bridge/src/agent_tools.ts) registers 21 tools. They cover view selection, binary metadata, functions, strings, callers and callees, IL, disassembly, decompilation, basic blocks, stack frames, xrefs, bytes, entry points, sections, segments, imports, exports and comments. Annotation tools can rename functions and set address comments. Binary queries require `binary_id`. List responses are paginated.
 
-## Добавлено после сверки
+`decompile_function`, `disassemble_function`, `basic_blocks` and `stack_frame` were added after the initial comparison. They return at most 200 records per page. Decompilation uses the registered Pseudo C renderer and falls back to HLIL with addresses.
 
-Инструменты `decompile_function`, `disassemble_function`, `basic_blocks` и `stack_frame` теперь доступны через MCP и локальный HTTP API. Они возвращают не более 200 строк, блоков или переменных на страницу. Декомпиляция использует зарегистрированный рендерер Pseudo C; если он недоступен, возвращается HLIL с адресами.
+## Missing features
 
-## Главные пробелы
-
-| Приоритет | Функциональность | Сейчас | Что стоит добавить |
+| Priority | Feature | Current support | Proposed addition |
 | --- | --- | --- | --- |
-| Высокий | Полная сводка функции | `inspect_function` сообщает имя, адрес и symbol. Нет границ/размера, сигнатуры и метрик функции. Basic blocks с рёбрами и stack layout теперь доступны отдельными инструментами. | Расширить метаданные функции сигнатурой и диапазоном; добавить метрики сложности. |
-| Высокий | Управление анализом | Нет отдельного статуса/прогресса анализа, запуска обновления, ожидания завершения или остановки. Получение IL может синхронно ждать анализа, если у функции выставлен `analysis_skipped`. | Добавить инструменты статуса и явного обновления анализа, чтобы клиент понимал, готов ли результат и сколько может занять запрос. |
-| Средний | Типы, локальные переменные и дополнительные аннотации | Запись ограничена именем функции и address comment. В `BinaryNinjaEndpoints` есть старые методы для списка data variables, stack variables, типов, сигнатуры и переименования/типизации локальных переменных, но текущий `/agent/` маршрут их не открывает. | Сначала чтение прототипа, stack/data variables и типов; затем безопасные записи с проверкой ожидаемого прежнего значения, как у `rename_function` и `set_comment`. |
-| Средний | Полная структура бинарника | Есть imports/exports, строки, entry points и memory map. Нет отдельного поиска всех символов, списка определённых data variables и чтения relocations. В Python API BinaryView доступны `data_vars` и `relocations_at`. | Добавить поиск символов и чтение глобальных переменных и relocations с пагинацией и фильтром по диапазону адресов. |
-| Средний | Открытие, закрытие и сохранение файлов и выбор вида | MCP умеет перечислить уже открытые BinaryViews, но не управляет жизненным циклом файла/базы и не перечисляет доступные виды одного файла. Сейчас бинарник нужно открыть в GUI, а изменения сохранить там вручную. | Если цель — автономный MCP workflow, добавить управляемые open/close/save и список доступных BinaryViews. Для GUI-only workflow это менее срочно. |
-| Низкий | Адресные выражения и представление данных | Схема адреса принимает только десятичную строку или `0x...`; имена символов и выражения Binary Ninja не принимаются. `read_bytes` возвращает hex, без base64; списковые запросы не имеют фильтра по диапазону адресов. | При необходимости поддержать выражения BN и диапазоны; вернуть base64 наряду с hex для чтения памяти. |
+| High | Function summary | `inspect_function` returns the name, address and symbol. Basic blocks and stack layout have separate tools. | Add signatures, address ranges and complexity metrics. |
+| High | Analysis control | No tool reports analysis progress, starts an update, waits for completion or stops analysis. IL requests may wait for analysis when `analysis_skipped` is set. | Add status and explicit analysis updates so clients can check whether results are ready. |
+| Medium | Types and variables | Writes are limited to function names and address comments. Older endpoint methods handle types and variables but have no `/agent/` routes. | Add prototype, type and variable queries. Require expected previous values for type and variable edits. |
+| Medium | Binary structure | Imports, exports, strings, entry points and memory maps are available. General symbol queries, data variable lists and relocations are missing. | Add paginated symbol, data variable and relocation queries with address filters. |
+| Medium | File management | The tools list open views. Files must be opened and databases saved in the GUI. | Add open, close and save operations if clients need to manage files without the GUI. |
+| Low | Address expressions and data formats | Addresses accept decimal or `0x` strings. `read_bytes` returns hex. List queries have no address range filters. | Add Binary Ninja address expressions, range filters and base64 output where needed. |
 
-## Рекомендуемый порядок
+## Suggested order
 
-1. Добавить сигнатуры, границы и метрики в обзор функции.
-2. Добавить статус и явное управление анализом.
-3. Открыть чтение data variables, символов, relocations и типов.
-4. Добавлять изменение типов и локальных переменных с проверкой актуального состояния; байтовые патчи оставить отдельной явно изменяющей бинарник операцией.
-5. Добавить управление файлами и BinaryViews, если требуется открывать и сохранять анализ без действий в GUI.
+1. Add signatures, ranges and metrics to function summaries.
+2. Add analysis status and update tools.
+3. Add data variable, symbol, relocation and type queries.
+4. Add type and local variable edits with checks against the current value. Keep byte patches as a separate operation.
+5. Add file management if clients need to open and save analysis without GUI actions.
 
-Приоритеты — оценка полезности для реверс-инжиниринга, а не обязательный набор Binary Ninja API. Раздел MCP в официальном руководстве перечисляет все эти группы, включая управление файлами, анализом, структурой бинарника и подробности функций; Python API документирует доступные данные BinaryView и Function.
+These priorities reflect reverse engineering use cases. The Binary Ninja MCP guide describes file management, analysis, binary structure and function details. The Python API documents the underlying BinaryView and Function data.
 
-## Источники
+## References
 
-- [Binary Ninja MCP Server — User Guide](https://docs.binary.ninja/guide/mcp.html)
-- [BinaryView — Python API](https://api.binary.ninja/binaryninja.binaryview-module.html)
-- [Function — Python API](https://api.binary.ninja/binaryninja.function-module.html)
-- Локальная реализация инструментов: [bridge/src/agent_tools.ts](../bridge/src/agent_tools.ts), [plugin/server/agent_http_server.py](../plugin/server/agent_http_server.py), [plugin/core/binary_operations.py](../plugin/core/binary_operations.py), [plugin/api/endpoints.py](../plugin/api/endpoints.py)
+- [Binary Ninja MCP Server User Guide](https://docs.binary.ninja/guide/mcp.html)
+- [BinaryView Python API](https://api.binary.ninja/binaryninja.binaryview-module.html)
+- [Function Python API](https://api.binary.ninja/binaryninja.function-module.html)
+- Source files: [agent_tools.ts](../bridge/src/agent_tools.ts), [agent_http_server.py](../plugin/server/agent_http_server.py), [binary_operations.py](../plugin/core/binary_operations.py), [endpoints.py](../plugin/api/endpoints.py)

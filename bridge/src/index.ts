@@ -8,7 +8,7 @@ import { registerAgentTools } from "./agent_tools.js";
 
 function parseArgs(): { host: string; port: number } {
   const args = process.argv.slice(2);
-  let host = "localhost";
+  let host = "127.0.0.1";
   let port = 9009;
 
   for (let i = 0; i < args.length; i++) {
@@ -21,7 +21,7 @@ function parseArgs(): { host: string; port: number } {
         break;
       case "--port":
         if (i + 1 < args.length) {
-          port = parseInt(args[++i], 10);
+          port = Number(args[++i]);
         }
         break;
       case "--help":
@@ -31,13 +31,14 @@ function parseArgs(): { host: string; port: number } {
 Usage: node dist/index.js [options]
 
 Options:
-  --host <host>     Binary Ninja MCP server host (default: localhost)
+  --host <host>     Binary Ninja MCP server host (default: 127.0.0.1)
   --port <port>     Binary Ninja MCP server port (default: 9009)
   --help, -h        Show this help message
 
 Environment variables:
   BINJA_MCP_HOST    Binary Ninja MCP server host
   BINJA_MCP_PORT    Binary Ninja MCP server port
+  BINJA_MCP_TOKEN   Optional shared HTTP authentication token
 `);
         process.exit(0);
         break;

@@ -170,7 +170,7 @@ def convert_number(text: str, size_param) -> dict:
         }
         u = result["little_endian"]["uint"]
         result["bases"] = {"dec": str(u), "hex": hex(u), "oct": oct(u), "bin": bin(u)}
-        result["warnings"].append("parsed as string; numeric parse failed")
+        result["warnings"].append("Parsed as a string because numeric parsing failed")
         return result
 
     result["kind"] = "int"

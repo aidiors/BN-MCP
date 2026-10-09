@@ -32,7 +32,7 @@ class FakeView:
             Obj(name=f"fn_{n}", raw_name=f"fn_{n}", start=0x1000 + n) for n in range(5)
         ]
         self._strings = [
-            Obj(start=0x2000 + n, length=4, value=f"Text{n}", type="Ascii") for n in range(5)
+            Obj(start=0x2000 + n, length=5, value=f"Text{n}", type="Ascii") for n in range(5)
         ]
 
     def get_strings(self):
@@ -47,6 +47,11 @@ class FakeView:
         return iter([0x4000, 0x4001])
 
     def read(self, address, length):
+        for ref in self._strings:
+            if address == ref.start:
+                return ref.value.encode()[:length]
+            if ref.start < address < ref.start + ref.length and ref.length > 4096:
+                return ref.value.encode()[address - ref.start : address - ref.start + length]
         return b"ABCD"[:length]
 
     def get_functions_containing(self, address):
@@ -71,6 +76,15 @@ class AgentQueryTests(unittest.TestCase):
         self.assertEqual([row["value"] for row in page["strings"]], ["Text2", "Text3"])
         self.assertEqual(page["next_offset"], 4)
         self.assertEqual(page_strings(self.view, query="missing")["strings"], [])
+
+    def test_string_search_checks_suffix_beyond_display_limit(self):
+        self.view._strings = [
+            Obj(start=0x2000, length=5006, value="A" * 5000 + "needle", type="Ascii")
+        ]
+        page = page_strings(self.view, query="NEEDLE")
+        self.assertEqual(len(page["strings"]), 1)
+        self.assertEqual(len(page["strings"][0]["value"]), 4096)
+        self.assertTrue(page["strings"][0]["value_truncated"])
 
     def test_symbol_page(self):
         symbols = (Obj(name=f"sym{n}", address=0x3000 + n, type="Export") for n in range(3))

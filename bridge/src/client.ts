@@ -4,6 +4,7 @@ import axios, { AxiosInstance } from "axios";
 export interface BinjaServerConfig {
   host: string;
   port: number;
+  authToken?: string;
 }
 
 export class BinjaHttpClient {
@@ -13,6 +14,8 @@ export class BinjaHttpClient {
     this.client = axios.create({
       baseURL: `http://${config.host}:${config.port}`,
       timeout: 30000,
+      proxy: false,
+      headers: config.authToken ? { Authorization: `Bearer ${config.authToken}` } : {},
     });
   }
 
@@ -33,7 +36,7 @@ export class BinjaHttpClient {
           ? String(detail.error) : error.message;
         const status = error.response?.status ? `HTTP ${error.response.status} ` : "";
         const current = detail && typeof detail === "object" && "current" in detail
-          ? `; current=${JSON.stringify(detail.current)}` : "";
+          ? `. Current value: ${JSON.stringify(detail.current)}` : "";
         throw new Error(`${status}${method} ${endpoint}: ${message}${current}`);
       }
       throw error;
@@ -61,6 +64,6 @@ export class BinjaHttpClient {
   }
 }
 
-export function createClient(host = "localhost", port = 9009): BinjaHttpClient {
-  return new BinjaHttpClient({ host, port });
+export function createClient(host = "127.0.0.1", port = 9009): BinjaHttpClient {
+  return new BinjaHttpClient({ host, port, authToken: process.env.BINJA_MCP_TOKEN });
 }

@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { BinjaHttpClient } from "./client.js";
 
-const binaryId = z.string().min(1).describe("view_id from list_binaries; required on every binary query");
+const binaryId = z.string().min(1).describe("view_id from list_binaries. Required on every binary query.");
 const identifier = z.string().min(1).describe("Function name or start address, e.g. 0x140001000");
 const address = z.string().regex(/^(0x[0-9a-fA-F]+|[0-9]+)$/)
   .describe("Virtual address in 0x-prefixed hex or decimal");
@@ -32,6 +32,7 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
     outputSchema: z.object({ binaries: z.array(z.object({
       id: z.string(), view_id: z.string(), filename: z.string().nullable(),
       basename: z.string().nullable(), active: z.boolean(), selectors: z.array(z.string()),
+      view_type: z.string().nullable().optional(),
     })) }),
     annotations: { readOnlyHint: true },
   }, async () => result(client.requestJson("/binaries")));
@@ -49,7 +50,7 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
     { binaryId: binary_id, includeSha256: include_sha256 })));
 
   server.registerTool("find_functions", {
-    description: "Page functions in address order; optional case-insensitive name substring. Continue with next_offset while truncated is true.",
+    description: "List functions in address order. Optionally filter names by a case-insensitive substring. Continue with next_offset while truncated is true.",
     inputSchema: { binary_id: binaryId, query: z.string().default(""), offset, limit },
     outputSchema: z.object({ binary_id: z.string(), functions: z.array(namedAddress), query: z.string(), ...page }),
     annotations: { readOnlyHint: true },
@@ -57,7 +58,7 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
     { binaryId: binary_id, query, offset, limit })));
 
   server.registerTool("find_strings", {
-    description: "Page strings; optional case-insensitive value substring. Each value is capped at 4096 characters.",
+    description: "List strings with an optional case-insensitive substring filter. Search covers the full value. Returned values are limited to 4096 characters.",
     inputSchema: { binary_id: binaryId, query: z.string().default(""), offset, limit },
     outputSchema: z.object({ binary_id: z.string(), strings: z.array(z.object({ address: z.string().nullable(),
       length: z.number().nullable(), type: z.string(), value: z.string(),
@@ -85,7 +86,7 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
     { binaryId: binary_id, address })));
 
   server.registerTool("related_functions", {
-    description: "Page callers or callees of a function by name or start address. Reanalysis may change their order; use xrefs_to for call-site evidence.",
+    description: "List callers or callees by function name or start address. Analysis updates may change their order. Use xrefs_to for call-site addresses.",
     inputSchema: { binary_id: binaryId, identifier,
       relation: z.enum(["callers", "callees"]), offset, limit },
     outputSchema: z.object({ binary_id: z.string(),
@@ -97,7 +98,7 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
       { binaryId: binary_id, identifier, relation, offset, limit })));
 
   server.registerTool("function_il", {
-    description: "Read one page of address-prefixed Binary Ninja IL. HLIL/MLIL/LLIL; SSA applies to MLIL and LLIL. Continue with next_offset.",
+    description: "Read a page of HLIL, MLIL or LLIL with addresses. SSA is available for MLIL and LLIL. Continue with next_offset.",
     inputSchema: { binary_id: binaryId, identifier,
       view: z.enum(["hlil", "mlil", "llil"]).default("hlil"),
       ssa: z.boolean().default(false), offset,
@@ -169,7 +170,7 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
       includeCode: include_code, includeData: include_data })));
 
   server.registerTool("read_bytes", {
-    description: "Read at most 4096 bytes at a virtual address; returns hex and reports partial reads.",
+    description: "Read at most 4096 bytes at a virtual address. Returns hex and reports partial reads.",
     inputSchema: { binary_id: binaryId, address,
       length: z.number().int().min(1).max(4096).default(256) },
     outputSchema: z.object({ binary_id: z.string(), address: z.string(), requested_length: z.number().int(),
@@ -198,7 +199,7 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
       { binary_id, action: "rename_function", address, expected_name, new_name })));
 
   server.registerTool("set_comment", {
-    description: "Set an address comment only if it still equals expected_comment. Read it first with read_comment; pass null if absent.",
+    description: "Set an address comment only if it equals expected_comment. Read it first with read_comment. Pass null if absent.",
     inputSchema: { binary_id: binaryId, address,
       expected_comment: z.string().nullable(), comment: z.string().max(16000) },
     outputSchema: z.object({ binary_id: z.string(), success: z.literal(true), action: z.literal("set_comment"),
