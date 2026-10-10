@@ -80,6 +80,13 @@ def main():
             "identity",
             "functions",
             "strings",
+            "strings&includeRefs=true&refLimit=1",
+            "analysisStatus",
+            f"functionContext&identifier={address}",
+            f"callSites&identifier={address}",
+            f"callSites&identifier={address}&direction=incoming",
+            f"variables&identifier={address}",
+            "type&name=__McpSmokeRecord",
             f"function&identifier={address}",
             f"functionAt&address={address}",
             f"relatedFunctions&identifier={address}&relation=callers",
@@ -101,6 +108,14 @@ def main():
             operation, _, params = route.partition("&")
             result = request(f"/agent/{operation}?binaryId={view_id}&limit=1&{params}")
             assert result["binary_id"] == view_id
+        call_function = next((f for f in view.functions if f.call_sites), None)
+        assert call_function is not None, "Smoke input needs at least one call site"
+        calls = request(
+            f"/agent/callSites?binaryId={view_id}&identifier={hex(call_function.start)}"
+        )
+        assert calls["calls"] and any(
+            call["unavailable_reason"] is None for call in calls["calls"]
+        ), calls
         assert mcp.binary_ops.current_view is (raw if raw is not None else view)
         request("/agent/functions?binaryId=0", expected=404)
         # Annotations are temporary analysis state on this separately loaded example.
@@ -127,10 +142,93 @@ def main():
         request("/agent/annotate", body)
         body.update(expected_comment="temporary MCP smoke check", comment=old_comment or "")
         request("/agent/annotate", body)
+        name = "__McpSmokeRecord"
+        assert view.get_type_by_name(name) is None
+        definition = request(
+            "/agent/annotate",
+            {
+                "binary_id": view_id,
+                "action": "define_type",
+                "name": name,
+                "expected_revision": None,
+                "declaration": f"struct {name} {{ int length; char *data; }};",
+            },
+        )
+        view.update_analysis_and_wait()
+        details = request(f"/agent/type?binaryId={view_id}&name={name}")
+        assert details["found"] and details["revision"] == definition["revision"]
+        view.undo()
+        view.update_analysis_and_wait()
+        assert view.get_type_by_name(name) is None
+        info = request(f"/agent/function?binaryId={view_id}&identifier={address}")
+        request(
+            "/agent/annotate",
+            {
+                "binary_id": view_id,
+                "action": "set_function_type",
+                "address": address,
+                "expected_revision": info["revision"],
+                "declaration": "int __mcp_probe(char *buffer, int length)",
+            },
+        )
+        view.update_analysis_and_wait()
+        updated = request(f"/agent/function?binaryId={view_id}&identifier={address}")
+        assert updated["revision"] != info["revision"] and updated["name"] == info["name"]
+        assert updated["return_type"] == "int32_t", updated
+        assert [p["name"] for p in updated["parameters"]] == ["buffer", "length"], updated
+        view.undo()
+        view.update_analysis_and_wait()
+        assert (
+            request(f"/agent/function?binaryId={view_id}&identifier={address}")["signature"]
+            == info["signature"]
+        )
+        variable_function = next(
+            (f for f in view.functions if any(v.type is not None for v in f.vars)), None
+        )
+        assert variable_function is not None, "Smoke input needs at least one typed variable"
+        variable_address = hex(variable_function.start)
+        variables = request(f"/agent/variables?binaryId={view_id}&identifier={variable_address}")[
+            "variables"
+        ]
+        variable = next(v for v in variables if v["type"] is not None)
+        changed = request(
+            "/agent/annotate",
+            {
+                "binary_id": view_id,
+                "action": "edit_variable",
+                "address": variable_address,
+                "variable_id": variable["id"],
+                "expected_revision": variable["revision"],
+                "new_name": "__mcp_variable_probe",
+                "new_type": "char *",
+            },
+        )
+        assert changed["requested_name"] == "__mcp_variable_probe"
+        view.update_analysis_and_wait()
+        after = request(f"/agent/variables?binaryId={view_id}&identifier={variable_address}")[
+            "variables"
+        ]
+        assert any(
+            v["name"] == "__mcp_variable_probe" and v["type"] == changed["requested_type"]
+            for v in after
+        ), after
+        view.undo()
+        view.update_analysis_and_wait()
+        restored = request(f"/agent/variables?binaryId={view_id}&identifier={variable_address}")[
+            "variables"
+        ]
+        assert any(
+            v["id"] == variable["id"]
+            and v["name"] == variable["name"]
+            and v["type"] == variable["type"]
+            for v in restored
+        )
         mcp.binary_ops.unregister_file(view.file)
         assert request("/binaries")["binaries"] == []
         request(f"/agent/functions?binaryId={view_id}", expected=404)
-        print(f"Live SDK {bn.core_version()}: all agent routes and both annotations passed")
+        print(
+            f"Live SDK {bn.core_version()}: all agent routes, annotations and decompilation edits passed"
+        )
     finally:
         mcp.stop()
         view.file.close()

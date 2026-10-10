@@ -2,8 +2,10 @@
 
 import importlib
 import json
+import re
 import sys
 import types
+from contextlib import contextmanager
 from enum import IntEnum
 from http.client import HTTPConnection
 from pathlib import Path
@@ -78,6 +80,62 @@ class FakeView:
         self.segments = []
         self._strings = []
         self._data = {}
+        self._types = {}
+        self._history = []
+        self.analysis_updates = 0
+        self.analysis_progress = Obj(state=Obj(name="IdleState"), count=1, total=1)
+
+    def parse_type_string(self, declaration, import_dependencies=True):
+        if "(" in declaration and ")" in declaration:
+            return FakeType(declaration, kind="FunctionTypeClass"), ""
+        if (
+            declaration in ("int32_t", "uint32_t", "uint64_t", "int", "char *")
+            or declaration.rstrip(" *") in self._types
+        ):
+            return FakeType(declaration), ""
+        raise SyntaxError("Invalid declaration")
+
+    def parse_types_from_string(self, declaration, import_dependencies=True):
+        names = re.findall(r"struct\s+(\w+)\s*\{", declaration)
+        if not names:
+            raise SyntaxError("Invalid declaration")
+        return Obj(
+            types={name: FakeType(f"struct {name}", declaration=declaration) for name in names},
+            functions={},
+            variables={},
+        )
+
+    def get_type_by_name(self, name):
+        return self._types.get(name)
+
+    def define_user_type(self, name, value):
+        self._types[str(name)] = value
+
+    def update_analysis(self):
+        self.analysis_updates += 1
+
+    @contextmanager
+    def undoable_transaction(self):
+        snapshot = (
+            dict(self._types),
+            [
+                (f, getattr(f, "type", None), [(v, v.name, v.type) for v in getattr(f, "vars", ())])
+                for f in self.functions
+            ],
+        )
+        self._history.append(snapshot)
+        try:
+            yield
+        except Exception:
+            self.undo()
+            raise
+
+    def undo(self):
+        self._types, functions = self._history.pop()
+        for function, value, variables in functions:
+            function.type = value
+            for variable, name, var_type in variables:
+                variable.name, variable.type = name, var_type
 
     def get_strings(self, start=None, length=None):
         if start is None:
@@ -148,6 +206,11 @@ class StringReference:
 
 
 class TextLine:
+    operation: Any
+    dest: Any
+    params: list[Any]
+    instr_index: int
+
     def __init__(self, address, text):
         self.address = address
         self.text = text
@@ -156,9 +219,72 @@ class TextLine:
         return self.text
 
 
+class FakeType:
+    def __init__(self, value, kind="IntegerTypeClass", declaration=None):
+        self.value = value
+        self.type_class = Obj(name=kind)
+        self.width = 8 if "64" in value or "*" in value else 4
+        self.alignment = self.width
+        self.parameters = []
+        self.declaration = declaration or value
+
+    def __str__(self):
+        return self.value
+
+    def __eq__(self, other):
+        return isinstance(other, FakeType) and self.declaration == other.declaration
+
+    def get_lines(self, view, name):
+        return self.declaration.splitlines()
+
+
+class FakeFunction(Obj):
+    def is_var_user_defined(self, variable):
+        return True
+
+    def create_user_var(self, variable, var_type, name):
+        variable.name = name
+        variable.type = var_type
+
+
 def populated_view():
     view = FakeView()
-    function = view.functions[0]
+    function = FakeFunction(**vars(view.functions[0]))
+    view.functions[0] = function
+    function.type = FakeType("int32_t(int32_t value)", kind="FunctionTypeClass")
+    function.type.parameters = [Obj(name="value", type=FakeType("int32_t"))]
+    function.return_type = FakeType("int32_t")
+    function.total_bytes = 2
+    function.address_ranges = [Obj(start=0x1000, end=0x1002)]
+    function.vars = [
+        Obj(
+            identifier=1,
+            name="value",
+            type=FakeType("int32_t"),
+            storage=0,
+            source_type=Obj(name="RegisterVariableSourceType"),
+            is_parameter_variable=True,
+        ),
+        Obj(
+            identifier=2,
+            name="local",
+            type=FakeType("int32_t"),
+            storage=-4,
+            source_type=Obj(name="StackVariableSourceType"),
+            is_parameter_variable=False,
+        ),
+    ]
+    argument = Obj(possible_values=Obj(type=Obj(name="ConstantValue"), value=16))
+    destination = Obj(possible_values=Obj(type=Obj(name="ConstantPointerValue"), value=0x1000))
+    call = TextLine(0x1001, "sub_1000(16)")
+    call.operation, call.dest, call.params, call.instr_index = (
+        Obj(name="MLIL_CALL"),
+        destination,
+        [argument],
+        1,
+    )
+    function.call_sites = [Obj(address=0x1001, function=function, mlil=call)]
+    function.caller_sites = []
     il = Obj(instructions=[TextLine(0x1000, "return 1"), TextLine(0x1001, "return 2")], root=Obj())
     il.ssa_form = il
     function.hlil = function.mlil = function.llil = il

@@ -25,6 +25,7 @@ class ViewRegistry:
         self._views: dict[str, weakref.ReferenceType] = {}
         self._ui_views: dict[str, Any] = {}
         self._next_id = 1
+        self._edit_versions: dict[tuple[str, int, str | None], int] = {}
         self.current: Any = None
 
     def _prune(self) -> None:
@@ -39,6 +40,19 @@ class ViewRegistry:
                 alive[key] = ref
         self._views = alive
         self._ui_views = {key: view for key, view in self._ui_views.items() if key in alive}
+        self._edit_versions = {
+            key: value for key, value in self._edit_versions.items() if key[0] in alive
+        }
+
+    def edit_version(
+        self, view_id: str, address: int, *, variable_id: str | None = None, advance: bool = False
+    ) -> int:
+        with self._lock:
+            key = (view_id, address, variable_id)
+            value = self._edit_versions.get(key, 0) + int(advance)
+            if advance:
+                self._edit_versions[key] = value
+            return value
 
     def register(self, view: Any, *, keep_alive: bool = False) -> str:
         with self._lock:
@@ -99,6 +113,7 @@ class ViewRegistry:
             for key in removed:
                 self._views.pop(key, None)
                 self._ui_views.pop(key, None)
+            self._prune()
             if self.current is not None and same_view(self.current.file, metadata):
                 self.current = None
             return len(removed)

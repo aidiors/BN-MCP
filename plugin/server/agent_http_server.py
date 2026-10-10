@@ -18,6 +18,7 @@ import binaryninja as bn
 from ..api.endpoints import BinaryNinjaEndpoints
 from ..core.binary_operations import BinaryOperations
 from ..core.config import Config
+from ..core.decompilation_edits import EditConflict
 
 
 class ConflictError(Exception):
@@ -248,7 +249,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send({"error": str(error)}, 503)
         elif isinstance(error, TimeoutError):
             self._send({"error": str(error)}, 408)
-        elif isinstance(error, ConflictError):
+        elif isinstance(error, (ConflictError, EditConflict)):
             self._send({"error": str(error), "current": error.current}, 409)
         elif isinstance(error, LookupError):
             self._send({"error": str(error)}, 404)
@@ -302,6 +303,10 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             if not path.startswith("/agent/"):
                 raise LookupError("Unknown route")
             binary_id = self._required(params, "binaryId")
+            if path == "/agent/analysisStatus":
+                self._select(binary_id)
+                self._send({"binary_id": binary_id, **self.binary_ops.get_analysis_status()})
+                return
             with self.server.operation():
                 self._select(binary_id)
                 data = self._read(path, params)
@@ -318,7 +323,32 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if path == "/agent/functions":
             return ops.get_functions_page(params.get("query", ""), offset, limit)
         if path == "/agent/strings":
-            return ops.get_strings_page(params.get("query", ""), offset, limit)
+            return ops.get_strings_page(
+                params.get("query", ""),
+                offset,
+                limit,
+                params.get("includeRefs") == "true",
+                int(params.get("refLimit", "5")),
+            )
+        if path == "/agent/functionContext":
+            return ops.get_function_context(
+                self._required(params, "identifier"),
+                params.get("include", "decompile,calls,variables").split(","),
+                int(params.get("lineLimit", "80")),
+                int(params.get("itemLimit", "20")),
+                int(params.get("maxChars", "32768")),
+            )
+        if path == "/agent/callSites":
+            return ops.get_calls_page(
+                self._required(params, "identifier"),
+                params.get("direction", "outgoing"),
+                offset,
+                limit,
+            )
+        if path == "/agent/variables":
+            return ops.get_variables_page(self._required(params, "identifier"), offset, limit)
+        if path == "/agent/type":
+            return ops.get_type_page(self._required(params, "name"), offset, limit)
         if path == "/agent/function":
             info = ops.get_function_info(self._required(params, "identifier"))
             if info is None:
@@ -435,6 +465,8 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
     def _annotate(self, data: dict[str, Any]) -> dict[str, Any]:
         ops = self.binary_ops
+        if data.get("action") in ("edit_variable", "set_function_type", "define_type"):
+            return ops.edit_decompilation(data)
         address = self._address(data.get("address"))
         action = data.get("action")
         if action == "rename_function":

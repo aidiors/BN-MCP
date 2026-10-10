@@ -6,7 +6,16 @@ from typing import Any
 
 import binaryninja as bn
 
+from . import decompilation_edits
 from .config import BinaryNinjaConfig
+from .function_analysis import (
+    analysis_status,
+    calls_page,
+    fit_context,
+    function_summary,
+    revision,
+    variables_page,
+)
 from .legacy_operations import LegacyBinaryOperations
 from .read_only_queries import (
     binary_identity,
@@ -138,15 +147,142 @@ class BinaryOperations(LegacyBinaryOperations):
             result["view_id"] = self.register_view(self._current_view)
         return result
 
+    def _function(self, identifier: str | int):
+        function = self.get_function_by_name_or_address(identifier)
+        if function is None:
+            raise LookupError(f"Function not found: {identifier}")
+        return function
+
+    def get_function_info(self, identifier: str | int) -> dict[str, Any] | None:
+        function = self.get_function_by_name_or_address(identifier)
+        return (
+            None if function is None else function_summary(function, self._edit_version(function))
+        )
+
+    def _edit_version(self, function, *, advance: bool = False):
+        identifier = self.registry.register(self._current_view)
+        return self.registry.edit_version(identifier, function.start, advance=advance)
+
+    def _variable_version(self, function, variable_id: str, *, advance: bool = False):
+        identifier = self.registry.register(self._current_view)
+        variable_version = self.registry.edit_version(
+            identifier, function.start, variable_id=variable_id, advance=advance
+        )
+        return revision(self._edit_version(function), variable_version)
+
+    def get_analysis_status(self):
+        return analysis_status(self._current_view)
+
+    def get_variables_page(self, identifier: str, offset: int = 0, limit: int = 100):
+        function = self._function(identifier)
+        return variables_page(
+            function, offset, limit, lambda var_id: self._variable_version(function, var_id)
+        )
+
+    def get_calls_page(
+        self, identifier: str, direction: str = "outgoing", offset: int = 0, limit: int = 100
+    ):
+        return calls_page(self._current_view, self._function(identifier), direction, offset, limit)
+
+    def get_function_context(
+        self,
+        identifier: str,
+        include: list[str],
+        line_limit: int = 80,
+        item_limit: int = 20,
+        max_chars: int = 32768,
+    ):
+        allowed = {"decompile", "calls", "variables", "callers"}
+        if not include or len(include) != len(set(include)) or not set(include) <= allowed:
+            raise ValueError(
+                "include must select distinct decompile, calls, variables or callers sections"
+            )
+        if (
+            not 1 <= line_limit <= 200
+            or not 1 <= item_limit <= 100
+            or not 2048 <= max_chars <= 65536
+        ):
+            raise ValueError(
+                "line_limit must be 1..200, item_limit 1..100 and max_chars 2048..65536"
+            )
+        function = self._function(identifier)
+        result = {
+            "binary_id": self.registry.register(self._current_view),
+            "function": function_summary(function, self._edit_version(function)),
+            "sections": {},
+            "unavailable": {},
+        }
+        for name in include:
+            try:
+                if name == "decompile":
+                    section = self.get_function_decompiled_page(identifier, 0, line_limit)
+                elif name == "calls":
+                    section = self.get_calls_page(identifier, "outgoing", 0, item_limit)
+                elif name == "variables":
+                    section = self.get_variables_page(identifier, 0, item_limit)
+                else:
+                    section = self.get_related_functions_page(identifier, "callers", 0, item_limit)
+                result["sections"][name] = section
+            except (RuntimeError, AttributeError) as error:
+                result["unavailable"][name] = str(error)[:512]
+        result["analysis"] = self.get_analysis_status()
+        return fit_context(result, max_chars)
+
+    def get_type_page(self, name: str, offset: int = 0, limit: int = 100):
+        return decompilation_edits.inspect_type(self._current_view, name, offset, limit)
+
+    def edit_decompilation(self, data: dict[str, Any]):
+        action = data.get("action")
+        if action == "define_type":
+            return decompilation_edits.define_type(self._current_view, data)
+        if action not in ("edit_variable", "set_function_type"):
+            raise ValueError("Unsupported decompilation edit")
+        address = data.get("address")
+        if not isinstance(address, str) or not address:
+            raise ValueError("address must be a function start address")
+        from .read_only_queries import _address
+
+        function = self._current_view.get_function_at(_address(address))
+        if function is None:
+            raise LookupError("Function not found at start address")
+        if action == "edit_variable":
+            result = decompilation_edits.edit_variable(
+                self._current_view,
+                function,
+                data,
+                self._variable_version(function, str(data.get("variable_id"))),
+            )
+            self._variable_version(function, data["variable_id"], advance=True)
+        else:
+            result = decompilation_edits.set_function_type(
+                self._current_view, function, data, self._edit_version(function)
+            )
+            self._edit_version(function, advance=True)
+        return result
+
     def get_functions_page(
         self, query: str = "", offset: int = 0, limit: int = 100
     ) -> dict[str, Any]:
         return page_functions(self._current_view, query, offset, limit)
 
     def get_strings_page(
-        self, query: str = "", offset: int = 0, limit: int = 100
+        self,
+        query: str = "",
+        offset: int = 0,
+        limit: int = 100,
+        include_refs: bool = False,
+        ref_limit: int = 5,
     ) -> dict[str, Any]:
-        return page_strings(self._current_view, query, offset, limit)
+        if not 1 <= ref_limit <= 20:
+            raise ValueError("ref_limit must be 1..20")
+        result = page_strings(self._current_view, query, offset, limit)
+        if include_refs:
+            for row in result["strings"]:
+                if row["address"] is not None:
+                    refs = self.get_xrefs_to_page(row["address"], 0, ref_limit)
+                    row["references"] = refs["references"]
+                    row["references_truncated"] = refs["truncated"]
+        return result
 
     def get_symbols_page(self, kind: str, offset: int = 0, limit: int = 100) -> dict[str, Any]:
         if self._current_view is None:
@@ -234,18 +370,37 @@ class BinaryOperations(LegacyBinaryOperations):
             except Exception:
                 rendered_lines = None
 
+        def convert_line(line):
+            contents = getattr(line, "contents", line)
+            address = getattr(contents, "address", None)
+            value = str(line)
+            return {
+                "text": value[:4096],
+                "text_truncated": len(value) > 4096,
+                "address": hex(address) if address is not None else None,
+                "il_index": getattr(contents, "instr_index", None),
+            }
+
         if rendered_lines is not None:
             page = page_items(
-                (str(line) for line in rendered_lines),
+                rendered_lines,
                 offset,
                 limit,
-                lambda line: line,
-                "lines",
+                convert_line,
+                "records",
             )
             result_language = "pseudo_c"
         else:
-            page = page_instructions(hlil.instructions, function.start, offset, limit)
+            page = page_items(hlil.instructions, offset, limit, convert_line, "records")
             result_language = "hlil"
+        for index, row in enumerate(page["records"], offset):
+            row["line_index"] = index
+        page["lines"] = [
+            f"{int(row['address'], 16) if row['address'] is not None else function.start:08x}        {row['text']}"
+            if result_language == "hlil"
+            else row["text"]
+            for row in page["records"]
+        ]
 
         return {
             "function": {"name": function.name, "address": hex(function.start)},

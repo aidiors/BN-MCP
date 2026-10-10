@@ -13,6 +13,33 @@ const page = { offset: z.number().int(), limit: z.number().int(),
   next_offset: z.number().int().nullable(), truncated: z.boolean() };
 const namedAddress = z.object({ name: z.string(), address: z.string() }).passthrough();
 const functionSummary = z.object({ name: z.string(), address: z.string() });
+const functionDetails = z.object({ name: z.string(), raw_name: z.string(), address: z.string(),
+  symbol: z.object({ type: z.string(), full_name: z.string().nullable() }).nullable(),
+  signature: z.string().nullable(), return_type: z.string().nullable(), calling_convention: z.string().nullable(),
+  parameters: z.array(z.object({ name: z.string().nullable(), type: z.string().nullable() })),
+  parameters_truncated: z.boolean(), ranges: z.array(z.object({ start: z.string().nullable(), end: z.string().nullable() })),
+  ranges_truncated: z.boolean(), total_bytes: z.number().nullable(), is_thunk: z.boolean(),
+  analysis_skipped: z.boolean(), revision: z.string() });
+const variableSummary = z.object({ id: z.string(), name: z.string().nullable(), type: z.string().nullable(),
+  size: z.number().nullable(), storage: z.string(), source: z.string(), parameter: z.boolean(), revision: z.string() });
+const variablesPage = z.object({ function: functionSummary, variables: z.array(variableSummary), ...page });
+const possibleValues = z.object({ kind: z.string(), value: z.string().nullable().optional(),
+  unavailable_reason: z.string().optional(),
+  values: z.array(z.string().nullable()).optional(),
+  ranges: z.array(z.object({ start: z.string(), end: z.string(), step: z.string() })).optional(),
+  truncated: z.boolean().optional() });
+const callsPage = z.object({ function: functionSummary, direction: z.enum(["outgoing", "incoming"]),
+  calls: z.array(z.object({ address: z.string().nullable(), caller: functionSummary,
+    il_index: z.number().nullable(), il: z.literal("mlil"), text: z.string().nullable(),
+    target: z.string().nullable(), target_name: z.string().nullable(), target_values: possibleValues,
+    arguments: z.array(z.object({ index: z.number().int(), expression: z.string().nullable(), possible_values: possibleValues })),
+    arguments_truncated: z.boolean(), unavailable_reason: z.string().nullable() })), ...page });
+const analysisStatus = z.object({ state: z.string(), ready: z.boolean(), completed: z.number().nullable(), total: z.number().nullable() });
+const codeRecord = z.object({ text: z.string(), text_truncated: z.boolean(), address: z.string().nullable(),
+  il_index: z.number().nullable(), line_index: z.number().int() });
+const decompiledPage = z.object({ function: functionSummary, representation: z.enum(["pseudo_c", "hlil"]),
+  lines: z.array(z.string()), records: z.array(codeRecord), ...page });
+const expectedRevision = z.string().length(64).describe("Revision from the latest read. A mismatch rejects the edit.");
 
 async function result(request: Promise<Record<string, unknown>>) {
   try {
@@ -59,19 +86,20 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
 
   server.registerTool("find_strings", {
     description: "List strings with an optional case-insensitive substring filter. Search covers the full value. Returned values are limited to 4096 characters.",
-    inputSchema: { binary_id: binaryId, query: z.string().default(""), offset, limit },
+    inputSchema: { binary_id: binaryId, query: z.string().default(""), offset, limit,
+      include_refs: z.boolean().default(false), ref_limit: z.number().int().min(1).max(20).default(5) },
     outputSchema: z.object({ binary_id: z.string(), strings: z.array(z.object({ address: z.string().nullable(),
       length: z.number().nullable(), type: z.string(), value: z.string(),
-      value_truncated: z.boolean() })), query: z.string(), ...page }),
+      value_truncated: z.boolean(), references: z.array(z.record(z.unknown())).optional(),
+      references_truncated: z.boolean().optional() })), query: z.string(), ...page }),
     annotations: { readOnlyHint: true },
-  }, async ({ binary_id, query, offset, limit }) => result(client.requestJson("/agent/strings",
-    { binaryId: binary_id, query, offset, limit })));
+  }, async ({ binary_id, query, offset, limit, include_refs, ref_limit }) => result(client.requestJson("/agent/strings",
+    { binaryId: binary_id, query, offset, limit, includeRefs: include_refs, refLimit: ref_limit })));
 
   server.registerTool("inspect_function", {
-    description: "Get exact function identity and symbol information by name or start address.",
+    description: "Read function identity, signature, parameters, ranges and revision by name or start address. Use revision for checked prototype edits.",
     inputSchema: { binary_id: binaryId, identifier },
-    outputSchema: z.object({ binary_id: z.string(), name: z.string(), raw_name: z.string(), address: z.string(),
-      symbol: z.object({ type: z.string(), full_name: z.string() }).nullable() }),
+    outputSchema: functionDetails.extend({ binary_id: z.string() }),
     annotations: { readOnlyHint: true },
   }, async ({ binary_id, identifier }) => result(client.requestJson("/agent/function",
     { binaryId: binary_id, identifier })));
@@ -113,8 +141,7 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
     description: "Page rendered Pseudo C for a function, falling back to address-prefixed HLIL if Pseudo C rendering is unavailable.",
     inputSchema: { binary_id: binaryId, identifier, offset,
       limit: z.number().int().min(1).max(200).default(80) },
-    outputSchema: z.object({ binary_id: z.string(), function: functionSummary,
-      representation: z.enum(["pseudo_c", "hlil"]), lines: z.array(z.string()), ...page }),
+    outputSchema: decompiledPage.extend({ binary_id: z.string() }),
     annotations: { readOnlyHint: true },
   }, async ({ binary_id, identifier, offset, limit }) =>
     result(client.requestJson("/agent/decompile",
@@ -237,4 +264,80 @@ export function registerAgentTools(server: McpServer, client: BinjaHttpClient): 
     }, async ({ binary_id, offset, limit }) => result(client.requestJson(`/agent/${kind}`,
       { binaryId: binary_id, offset, limit })));
   }
+
+  server.registerTool("analysis_status", {
+    description: "Read analysis state without waiting behind code queries. Poll ready after changing types or variables.",
+    inputSchema: { binary_id: binaryId },
+    outputSchema: analysisStatus.extend({ binary_id: z.string() }),
+    annotations: { readOnlyHint: true },
+  }, async ({ binary_id }) => result(client.requestJson("/agent/analysisStatus", { binaryId: binary_id })));
+
+  server.registerTool("function_context", {
+    description: "Read selected function context in one request. Each section has pagination. max_chars bounds serialized context. Continue shortened sections with their dedicated tools.",
+    inputSchema: { binary_id: binaryId, identifier,
+      include: z.array(z.enum(["decompile", "calls", "variables", "callers"])).min(1).max(4).default(["decompile", "calls", "variables"]),
+      line_limit: z.number().int().min(1).max(200).default(80),
+      item_limit: z.number().int().min(1).max(100).default(20),
+      max_chars: z.number().int().min(2048).max(65536).default(32768) },
+    outputSchema: z.object({ binary_id: z.string(), function: functionDetails,
+      sections: z.object({ decompile: decompiledPage.optional(), calls: callsPage.optional(),
+        variables: variablesPage.optional(), callers: z.object({ function: namedAddress, relation: z.literal("callers"),
+          functions: z.array(namedAddress), ...page }).optional() }),
+      unavailable: z.record(z.string()), analysis: analysisStatus, budget_truncated: z.boolean() }),
+    annotations: { readOnlyHint: true },
+  }, async ({ binary_id, identifier, include, line_limit, item_limit, max_chars }) =>
+    result(client.requestJson("/agent/functionContext", { binaryId: binary_id, identifier, include: include.join(","),
+      lineLimit: line_limit, itemLimit: item_limit, maxChars: max_chars })));
+
+  server.registerTool("call_sites", {
+    description: "Read incoming or outgoing call sites with MLIL argument expressions and known possible values. Unknown targets remain unresolved. Continue with next_offset.",
+    inputSchema: { binary_id: binaryId, identifier, direction: z.enum(["outgoing", "incoming"]).default("outgoing"), offset, limit },
+    outputSchema: callsPage.extend({ binary_id: z.string() }),
+    annotations: { readOnlyHint: true },
+  }, async ({ binary_id, identifier, direction, offset, limit }) => result(client.requestJson("/agent/callSites",
+    { binaryId: binary_id, identifier, direction, offset, limit })));
+
+  server.registerTool("function_variables", {
+    description: "Read local and parameter variables with IDs, types and revisions. Use the ID and revision for checked variable edits.",
+    inputSchema: { binary_id: binaryId, identifier, offset, limit },
+    outputSchema: variablesPage.extend({ binary_id: z.string() }),
+    annotations: { readOnlyHint: true },
+  }, async ({ binary_id, identifier, offset, limit }) => result(client.requestJson("/agent/variables",
+    { binaryId: binary_id, identifier, offset, limit })));
+
+  server.registerTool("inspect_type", {
+    description: "Read a named type definition and revision. A missing type returns found=false and revision=null. Continue definition lines with next_offset.",
+    inputSchema: { binary_id: binaryId, name: z.string().min(1).max(256), offset, limit },
+    outputSchema: z.object({ binary_id: z.string(), name: z.string(), found: z.boolean(), type: z.string().nullable(),
+      size: z.number().nullable(), alignment: z.number().nullable(), revision: z.string().nullable(), lines: z.array(z.string()), ...page }),
+    annotations: { readOnlyHint: true },
+  }, async ({ binary_id, name, offset, limit }) => result(client.requestJson("/agent/type", { binaryId: binary_id, name, offset, limit })));
+
+  server.registerTool("edit_variable", {
+    description: "Change a variable name, type or both using its ID and current revision. The edit is undoable and requests analysis. Read variables again after analysis.",
+    inputSchema: { binary_id: binaryId, address, variable_id: z.string().min(1).max(64), expected_revision: expectedRevision,
+      new_name: z.string().min(1).max(256).optional(), new_type: z.string().min(1).max(4096).optional() },
+    outputSchema: z.object({ binary_id: z.string(), success: z.literal(true), action: z.literal("edit_variable"), address: z.string(),
+      previous: variableSummary, variable_id: z.string(), requested_name: z.string(), requested_type: z.string().nullable(),
+      analysis_requested: z.literal(true) }),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  }, async (args) => result(client.postJsonStrict("/agent/annotate", { ...args, action: "edit_variable" })));
+
+  server.registerTool("set_function_type", {
+    description: "Apply a C function prototype if the revision from inspect_function still matches. The edit is undoable and requests analysis. Function names are unchanged.",
+    inputSchema: { binary_id: binaryId, address, expected_revision: expectedRevision, declaration: z.string().min(1).max(8192) },
+    outputSchema: z.object({ binary_id: z.string(), success: z.literal(true), action: z.literal("set_function_type"), address: z.string(),
+      previous: z.object({ signature: z.string().nullable(), revision: z.string() }), requested_signature: z.string().nullable(),
+      analysis_requested: z.literal(true) }),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  }, async (args) => result(client.postJsonStrict("/agent/annotate", { ...args, action: "set_function_type" })));
+
+  server.registerTool("define_type", {
+    description: "Create or replace exactly one named C type. Use the revision from inspect_type, or null if absent. The edit is undoable and requests analysis.",
+    inputSchema: { binary_id: binaryId, name: z.string().min(1).max(256), declaration: z.string().min(1).max(16384),
+      expected_revision: expectedRevision.nullable() },
+    outputSchema: z.object({ binary_id: z.string(), success: z.literal(true), action: z.literal("define_type"), name: z.string(),
+      previous_revision: z.string().nullable(), revision: z.string(), analysis_requested: z.literal(true) }),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  }, async (args) => result(client.postJsonStrict("/agent/annotate", { ...args, action: "define_type" })));
 }
